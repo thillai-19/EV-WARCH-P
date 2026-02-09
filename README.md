@@ -61,7 +61,6 @@ Files:
 One-line copy-paste (pipes into stdin, raw order):
 
 ```bash
-python3 main.py <<'EOF'
 Bengaluru, Karnataka, India
 12.9716
 77.5946
@@ -76,7 +75,6 @@ Bengaluru, Karnataka, India
 25.0
 n
 20.0
-EOF
 ```
 
 **Current Limitations**
