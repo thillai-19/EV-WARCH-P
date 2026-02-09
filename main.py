@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import math
-import heapq
 from dataclasses import dataclass
 from typing import Dict, Tuple, List, Optional
 
@@ -11,6 +10,7 @@ import networkx as nx
 import osmnx as ox
 import os
 import sys
+import json
 
 OCM_API_KEY = os.environ.get("OPENCHARGEMAP_API_KEY")
 
@@ -26,13 +26,6 @@ class VehicleSpec:
     charge_power_kw: float = 50.0          # assumed DCFC power for prototype
     target_cabin_temp_c: float = 22.0
     current_soc: float = 0.80              # start SOC (0.0 - 1.0)
-
-
-@dataclass
-class RoutingParams:
-    soc_bins: int = 30
-    lambda_risk: float = 60.0  # minutes penalty per unit risk (tune for demos)
-    max_route_km: float = 500.0
 
 
 # ----------------------------
@@ -155,54 +148,18 @@ def hvac_kwh_per_km(temp_c: float, wind_kmh: float, target_cabin_c: float) -> fl
     return max(hvac, 0.0)
 
 
-def station_success_probability(success: int, total: int, degradation: float = 1.0,
-                                alpha: float = 2.0, beta: float = 2.0) -> float:
-    total = max(total, 0)
-    success = min(max(success, 0), total) if total > 0 else 0
-    p = (success + alpha) / (total + alpha + beta)
-    p *= float(np.clip(degradation, 0.0, 1.0))
-    return float(np.clip(p, 0.0, 1.0))
-
-
-# ----------------------------
-# Routing helpers
-# ----------------------------
-def discretize_soc(soc: float, bins: int) -> int:
-    soc = float(np.clip(soc, 0.0, 1.0))
-    return int(round(soc * (bins - 1)))
-
-
-def undiscretize_soc(bin_id: int, bins: int) -> float:
-    return bin_id / (bins - 1)
-
-
-def build_graph_bbox(src_lat: float, src_lon: float, dst_lat: float, dst_lon: float,
-                     buffer_km: float = 20.0) -> nx.MultiDiGraph:
-    """
-    Build OSMnx driving graph that covers the box containing source and destination + a buffer.
-    buffer_km: how many kilometers to extend the bounding box on all sides (default 20 km)
-    """
-    # approx degrees for buffer
-    deg_per_km_lat = 1.0 / 111.0
-    avg_lat = (src_lat + dst_lat) / 2.0
-    deg_per_km_lon = 1.0 / (111.320 * math.cos(math.radians(avg_lat)) + 1e-9)
-
-    bdeg_lat = buffer_km * deg_per_km_lat
-    bdeg_lon = buffer_km * deg_per_km_lon
-
-    north = max(src_lat, dst_lat) + bdeg_lat
-    south = min(src_lat, dst_lat) - bdeg_lat
-    east = max(src_lon, dst_lon) + bdeg_lon
-    west = min(src_lon, dst_lon) - bdeg_lon
-
-    print(f"Building graph bounding box: north={north:.4f} south={south:.4f} east={east:.4f} west={west:.4f}")
-    G = ox.graph_from_bbox(
-    bbox=(north, south, east, west),
-    network_type="drive"
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dlat / 2.0) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(dlon / 2.0) ** 2
     )
-    G = ox.add_edge_speeds(G)
-    G = ox.add_edge_travel_times(G)
-    return G
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+    return r * c
 
 
 def snap_points_to_graph(G: nx.MultiDiGraph, lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
@@ -210,156 +167,159 @@ def snap_points_to_graph(G: nx.MultiDiGraph, lats: np.ndarray, lons: np.ndarray)
     return np.array(nodes, dtype=np.int64)
 
 
-def risk_aware_route(
+def compute_kwh_per_km(temp_c: float, wind_kmh: float, vehicle: VehicleSpec) -> float:
+    hvac_term = hvac_kwh_per_km(temp_c, wind_kmh, vehicle.target_cabin_temp_c)
+    return vehicle.base_kwh_per_km + hvac_term
+
+
+def plan_single_charge_route(
     G: nx.MultiDiGraph,
     source_node: int,
     target_node: int,
     chargers_df: pd.DataFrame,
-    charger_logs_df: pd.DataFrame,
     temp_c: float,
     wind_kmh: float,
     vehicle: VehicleSpec,
-    params: RoutingParams,
 ) -> Dict:
     """
-    Returns best path info using risk-aware objective with SOC + charging.
+    Plan: if destination is within current range, go direct.
+    Otherwise, find all reachable chargers and pick the optimal one
+    (shortest total distance) then drive -> charge -> drive.
     """
-    charger_nodes = set(chargers_df["graph_node"].tolist()) if not chargers_df.empty else set()
-
-    # Map station_id -> success probability from logs
-    log_map = {row.station_id: row for row in charger_logs_df.itertuples(index=False)} if not charger_logs_df.empty else {}
-    station_p = {}
-    for row in chargers_df.itertuples(index=False):
-        log = log_map.get(row.station_id, None)
-        if log is None:
-            p = station_success_probability(5, 10, degradation=0.9)
-        else:
-            p = station_success_probability(int(log.success), int(log.total), float(log.degradation))
-        station_p[row.station_id] = p
-
-    node_p = {}
-    for row in chargers_df.itertuples(index=False):
-        node_p[row.graph_node] = max(node_p.get(row.graph_node, 0.0), station_p[row.station_id])
-
-    hvac_term = hvac_kwh_per_km(temp_c, wind_kmh, vehicle.target_cabin_temp_c)
-
-    bins = params.soc_bins
-    start_soc = float(np.clip(vehicle.current_soc, 0.0, 1.0))
-    start_bin = discretize_soc(start_soc, bins)
-
-    INF = 1e18
-    dist = {}
-    prev = {}
-    pq = []
-
-    start_state = (source_node, start_bin)
-    dist[start_state] = 0.0
-    heapq.heappush(pq, (0.0, start_state))
-
+    kwh_per_km = compute_kwh_per_km(temp_c, wind_kmh, vehicle)
     reserve_kwh = vehicle.battery_kwh * vehicle.min_soc_reserve
+    current_kwh = vehicle.battery_kwh * float(np.clip(vehicle.current_soc, 0.0, 1.0))
+    usable_kwh = max(current_kwh - reserve_kwh, 0.0)
+    range_km = usable_kwh / max(kwh_per_km, 1e-9)
 
-    def soc_bin_to_kwh(soc_bin: int) -> float:
-        soc = undiscretize_soc(soc_bin, bins)
-        return soc * vehicle.battery_kwh
+    len_from_source = nx.single_source_dijkstra_path_length(G, source_node, weight="length")
+    if target_node not in len_from_source:
+        return {"ok": False, "reason": "No path to destination on road network."}
 
-    def kwh_to_soc_bin(kwh: float) -> int:
-        soc = float(np.clip(kwh / vehicle.battery_kwh, 0.0, 1.0))
-        return discretize_soc(soc, bins)
+    dist_src_to_target_km = len_from_source[target_node] / 1000.0
+    time_from_source = nx.single_source_dijkstra_path_length(G, source_node, weight="travel_time")
+    time_to_target = nx.single_source_dijkstra_path_length(G.reverse(copy=False), target_node, weight="travel_time")
 
-    while pq:
-        cur_cost, (u, soc_bin) = heapq.heappop(pq)
-        if cur_cost != dist.get((u, soc_bin), INF):
+    print(f"Estimated range from current SOC: {range_km:.2f} km")
+    print(f"Shortest path distance (source -> destination): {dist_src_to_target_km:.2f} km")
+
+    def route_nodes(u: int, v: int) -> List[int]:
+        if u == v:
+            return [u]
+        return nx.shortest_path(G, u, v, weight="length")
+
+    def nodes_to_coords(nodes: List[int]) -> List[Tuple[float, float]]:
+        coords = []
+        for n in nodes:
+            data = G.nodes[n]
+            coords.append((float(data["y"]), float(data["x"])))
+        return coords
+
+    def edge_length_km(u: int, v: int) -> float:
+        data = G.get_edge_data(u, v)
+        if not data:
+            return 0.0
+        best = None
+        for _, attrs in data.items():
+            length_m = float(attrs.get("length", 0.0))
+            if best is None or length_m < best:
+                best = length_m
+        return (best or 0.0) / 1000.0
+
+    def drive_actions_from_nodes(nodes: List[int]) -> List[Tuple[str, int, int, float]]:
+        actions = []
+        for i in range(len(nodes) - 1):
+            u = nodes[i]
+            v = nodes[i + 1]
+            dist_km = edge_length_km(u, v)
+            actions.append(("DRIVE", u, v, dist_km))
+        return actions
+
+    if dist_src_to_target_km <= range_km:
+        time_min = (time_from_source.get(target_node, 0.0) or 0.0) / 60.0
+        nodes = route_nodes(source_node, target_node)
+        drive_actions = drive_actions_from_nodes(nodes)
+        return {
+            "ok": True,
+            "cost_minutes": time_min,
+            "actions": drive_actions,
+            "route_nodes": nodes,
+            "route_coords": nodes_to_coords(nodes),
+        }
+
+    if chargers_df.empty:
+        return {"ok": False, "reason": "Destination out of range and no chargers available."}
+
+    len_to_target = nx.single_source_dijkstra_path_length(G.reverse(copy=False), target_node, weight="length")
+
+    max_soc_kwh = vehicle.max_soc * vehicle.battery_kwh
+    usable_kwh_after = max(max_soc_kwh - reserve_kwh, 0.0)
+    range_after_km = usable_kwh_after / max(kwh_per_km, 1e-9)
+
+    best = None
+    charger_nodes = chargers_df["graph_node"].dropna().astype(int).tolist()
+
+    # Minimum distance from start before allowing a charge stop. Adjust or remove as needed.
+    min_dist_from_start_km = 1.0
+    for c in charger_nodes:
+        if c not in len_from_source or c not in len_to_target:
+            continue
+        dist1_km = len_from_source[c] / 1000.0
+        dist2_km = len_to_target[c] / 1000.0
+        if dist1_km <= min_dist_from_start_km:
+            continue
+        if dist1_km > range_km:
+            continue
+        if dist2_km > range_after_km:
             continue
 
-        if u == target_node:
-            break
+        time1_min = (time_from_source.get(c, 0.0) or 0.0) / 60.0
+        time2_min = (time_to_target.get(c, 0.0) or 0.0) / 60.0
 
-        u_kwh = soc_bin_to_kwh(soc_bin)
+        kwh_after_drive = current_kwh - dist1_km * kwh_per_km
+        add_kwh = max(max_soc_kwh - kwh_after_drive, 0.0)
+        charge_time_min = 60.0 * add_kwh / max(vehicle.charge_power_kw, 1e-6)
 
-        # DRIVE transitions
-        for _, v, key, data in G.out_edges(u, keys=True, data=True):
-            dist_m = float(data.get("length", 0.0))
-            dist_km = dist_m / 1000.0
-            travel_time_s = float(data.get("travel_time", 0.0) or 0.0)
-            travel_time_min = travel_time_s / 60.0
+        total_cost = time1_min + time2_min + charge_time_min
+        total_dist = dist1_km + dist2_km
 
-            seg_kwh = dist_km * (vehicle.base_kwh_per_km + hvac_term)
+        cand = {
+            "charger_node": c,
+            "dist1_km": dist1_km,
+            "dist2_km": dist2_km,
+            "add_kwh": add_kwh,
+            "cost_minutes": total_cost,
+            "total_dist_km": total_dist,
+        }
 
-            if (u_kwh - seg_kwh) < reserve_kwh:
-                continue
+        if best is None or cand["cost_minutes"] < best["cost_minutes"]:
+            best = cand
 
-            v_kwh = u_kwh - seg_kwh
-            v_soc_bin = kwh_to_soc_bin(v_kwh)
+    if best is None:
+        return {"ok": False, "reason": "No reachable charger found within current range."}
 
-            new_cost = cur_cost + travel_time_min
+    nodes_a = route_nodes(source_node, best["charger_node"])
+    nodes_b = route_nodes(best["charger_node"], target_node)
+    full_nodes = nodes_a + nodes_b[1:] if nodes_b else nodes_a
+    full_coords = nodes_to_coords(full_nodes)
+    drive_actions_a = drive_actions_from_nodes(nodes_a)
+    drive_actions_b = drive_actions_from_nodes(nodes_b)
+    charge_coord = nodes_to_coords([best["charger_node"]])[0]
 
-            state2 = (v, v_soc_bin)
-            if new_cost < dist.get(state2, INF):
-                dist[state2] = new_cost
-                prev[state2] = ((u, soc_bin), ("DRIVE", u, v, dist_km))
-                heapq.heappush(pq, (new_cost, state2))
+    print(
+        "Chosen charger node: "
+        f"{best['charger_node']} | dist1={best['dist1_km']:.2f} km | "
+        f"dist2={best['dist2_km']:.2f} km | charge={best['add_kwh']:.2f} kWh"
+    )
 
-                # Force charge if SOC < 40% and charger exists
-        if u in charger_nodes and u_kwh < 0.4 * vehicle.battery_kwh:
-            p = node_p.get(u, 0.8)
-            risk_penalty = params.lambda_risk * (1.0 - p)
-
-            target_kwh = vehicle.max_soc * vehicle.battery_kwh
-            add_kwh = target_kwh - u_kwh
-
-            charge_time_min = 60 * add_kwh / vehicle.charge_power_kw
-            new_cost = cur_cost + charge_time_min + risk_penalty
-
-            new_bin = kwh_to_soc_bin(target_kwh)
-            state2 = (u, new_bin)
-
-            if new_cost < dist.get(state2, INF):
-                dist[state2] = new_cost
-                prev[state2] = ((u, soc_bin), ("CHARGE", u, add_kwh, p))
-                heapq.heappush(pq, (new_cost, state2))
-
-
-        # CHARGE action (if charger available at node)
-        if u in charger_nodes:
-            p = node_p.get(u, 0.70)
-            risk_penalty = params.lambda_risk * (1.0 - p)
-
-            target_soc = vehicle.max_soc
-            target_kwh = target_soc * vehicle.battery_kwh
-
-            if target_kwh > u_kwh + 1e-9:
-                add_kwh = target_kwh - u_kwh
-                charge_time_h = add_kwh / max(vehicle.charge_power_kw, 1e-6)
-                charge_time_min = 60.0 * charge_time_h
-
-                new_kwh = target_kwh
-                new_bin = kwh_to_soc_bin(new_kwh)
-                new_cost = cur_cost + charge_time_min + risk_penalty
-
-                state2 = (u, new_bin)
-                if new_cost < dist.get(state2, INF):
-                    dist[state2] = new_cost
-                    prev[state2] = ((u, soc_bin), ("CHARGE", u, add_kwh, p))
-                    heapq.heappush(pq, (new_cost, state2))
-
-    end_states = [(cost, state) for state, cost in dist.items() if state[0] == target_node]
-    if not end_states:
-        return {"ok": False, "reason": "No feasible route found with SOC constraints."}
-
-    best_cost, best_state = min(end_states, key=lambda x: x[0])
-
-    actions = []
-    cur = best_state
-    while cur != start_state:
-        pr = prev.get(cur)
-        if pr is None:
-            break
-        cur_prev, act = pr
-        actions.append(act)
-        cur = cur_prev
-    actions.reverse()
-
-    return {"ok": True, "cost_minutes": best_cost, "actions": actions}
+    charge_action = ("CHARGE", best["charger_node"], best["add_kwh"], charge_time_min, charge_coord)
+    return {
+        "ok": True,
+        "cost_minutes": best["cost_minutes"],
+        "actions": drive_actions_a + [charge_action] + drive_actions_b,
+        "route_nodes": full_nodes,
+        "route_coords": full_coords,
+    }
 
 
 # ----------------------------
@@ -392,41 +352,34 @@ def main():
 
     # Routing / environment
     print("\nRouting & environment:")
-    lambda_risk = input_with_default(" Risk penalty lambda (minutes per unit failure)", 60.0, float)
-    soc_bins = input_with_default(" Number of SOC bins (discretization)", 30, int)
     charger_search_radius_km = input_with_default(" Charger search radius (km) (for initial fetch)", 30.0, float)
     weather_override = input_with_default(" Skip live weather? (y/n)", "n", str).lower().startswith("y")
 
     # Build graph for bounding box around src/dst
     buffer_km = input_with_default(" Graph bbox buffer (km)", 10.0, float)
+    straight_km = haversine_km(src_lat, src_lon, dst_lat, dst_lon)
+    min_buffer_km = straight_km / 2.0 + 10.0
+    if buffer_km < min_buffer_km:
+        print(f"Auto-adjusting buffer_km from {buffer_km:.1f} to {min_buffer_km:.1f} km")
+        buffer_km = min_buffer_km
     print("\nConstructing graph (this may take some time)...")
-    print("\nConstructing graph using district-level regions...")
-    if os.path.exists("amaravati_vizag_corridor.graphml"):
-        print("Loading cached road graph...")
-        G = ox.load_graphml("amaravati_vizag_corridor.graphml")
-    else:
-        print("Building road graph from Overpass...")
-        G = ox.graph_from_place(
-        [
-            "Krishna district, Andhra Pradesh, India",
-            "Guntur district, Andhra Pradesh, India",
-            "Bapatla district, Andhra Pradesh, India",
-
-            "West Godavari district, Andhra Pradesh, India",
-            "Eluru district, Andhra Pradesh, India",
-            "East Godavari district, Andhra Pradesh, India",
-            "Kakinada district, Andhra Pradesh, India",
-
-            "Visakhapatnam district, Andhra Pradesh, India"
-
-        ],
-        network_type="drive"
+    print("\nConstructing graph using point-radius...")
+    cache_name = (
+        f"graph_{src_lat:.3f}_{src_lon:.3f}_to_{dst_lat:.3f}_{dst_lon:.3f}"
+        f"_r{buffer_km:.0f}km.graphml"
     )
-    G = ox.add_edge_speeds(G)
-    G = ox.add_edge_travel_times(G)
-    ox.save_graphml(G, "amaravati_vizag_corridor.graphml")
-    ox.save_graphml(G, "amaravati_vizag_corridor.graphml")
-    print("Graph saved to amaravati_vizag_corridor.graphml")
+    if os.path.exists(cache_name):
+        print(f"Loading cached graph: {cache_name}")
+        G = ox.load_graphml(cache_name)
+    else:
+        center_lat = (src_lat + dst_lat) / 2.0
+        center_lon = (src_lon + dst_lon) / 2.0
+        dist_m = max(500, int(buffer_km * 1000))
+        G = ox.graph_from_point((center_lat, center_lon), dist=dist_m, network_type="drive")
+        G = ox.add_edge_speeds(G)
+        G = ox.add_edge_travel_times(G)
+        ox.save_graphml(G, cache_name)
+        print(f"Graph saved to {cache_name}")
 
 
     # Snap source/target to nearest graph nodes
@@ -488,17 +441,6 @@ def main():
 
         print(f"Fetched {len(chargers)} chargers (snapped to graph nodes).")
 
-    # Synthetic charger logs (if chargers exist)
-    if not chargers.empty:
-        rng = np.random.default_rng(7)
-        logs = chargers[["station_id"]].copy()
-        logs["total"] = rng.integers(5, 60, size=len(logs))
-        logs["success"] = (logs["total"] * rng.uniform(0.6, 0.95, size=len(logs))).astype(int)
-        logs["degradation"] = rng.uniform(0.85, 1.0, size=len(logs))
-        charger_logs_df = logs
-    else:
-        charger_logs_df = pd.DataFrame(columns=["station_id", "total", "success", "degradation"])
-
     # Build vehicle & routing params from user inputs
     vehicle = VehicleSpec(
         battery_kwh=battery_kwh,
@@ -509,28 +451,38 @@ def main():
         target_cabin_temp_c=target_cabin_temp,
         current_soc=current_soc,
     )
-    params = RoutingParams(soc_bins=soc_bins, lambda_risk=lambda_risk)
 
-    print("\nRunning risk-aware routing...")
-    result = risk_aware_route(
+    print("\nRunning range-aware routing...")
+    result = plan_single_charge_route(
         G=G,
         source_node=source_node,
         target_node=target_node,
         chargers_df=chargers,
-        charger_logs_df=charger_logs_df,
         temp_c=temp_c,
         wind_kmh=wind_kmh,
         vehicle=vehicle,
-        params=params,
     )
 
     if not result["ok"]:
         print("Routing failed:", result["reason"])
         return
 
-    print(f"\nBest risk-adjusted cost: {result['cost_minutes']:.1f} minutes")
+    print(f"\nEstimated travel time: {result['cost_minutes']:.1f} minutes")
     total_km = sum(a[3] for a in result["actions"] if a[0] == "DRIVE")
     print(f"Approx total distance (sum of edges): {total_km:.2f} km")
+    for act in result["actions"]:
+        if act[0] == "CHARGE":
+            print(f"Estimated charging time: {act[3]:.1f} minutes")
+            break
+    if "route_coords" in result:
+        print(f"Route nodes count: {len(result['route_coords'])}")
+        route_out = {
+            "route_coords": result["route_coords"],
+            "actions": result["actions"],
+        }
+        with open("route_output.json", "w", encoding="utf-8") as f:
+            json.dump(route_out, f, ensure_ascii=False)
+        print("Saved route_output.json")
     print("Actions (first 200 shown):")
     for act in result["actions"][:200]:
         print(act)
