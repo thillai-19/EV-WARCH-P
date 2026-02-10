@@ -105,15 +105,12 @@ Then open [http://localhost:8000/index.html](http://localhost:8000/index.html)
 
 - Long-distance graphs may still take time to build on first run
 - Charger selection is single-stop (one charge) in the current routing mode
-- External map visualization requires consuming `route_output.json`
 
 **Planned Improvements**
 
 - Multi-stop charging for very long routes
-- Improved charger discovery along the entire route
 - Performance optimization for long inter-state routes
 - Route visualization and SOC profiling
-- Integration of live charger availability data
 
 **Motivation**
 
