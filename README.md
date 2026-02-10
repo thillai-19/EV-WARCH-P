@@ -35,47 +35,71 @@ Routing an EV trip from Vijayawada to Hyderabad while ensuring:
 
 **Sample Input**
 
-Labeled reference (human-friendly):
-
-```text
-place: Bengaluru, Karnataka, India
-source_lat: 12.9716
-source_lon: 77.5946
-dest_lat: 12.2958
-dest_lon: 76.6394
-battery_kwh: 60.0
-current_soc: 0.20
-min_soc_reserve: 0.10
-base_kwh_per_km: 0.20
-charge_power_kw: 50.0
-target_cabin_temp_c: 18.0
-charger_search_radius_km: 25.0
-skip_live_weather: n
-graph_buffer_km: 20.0
-```
-
-Files:
-
-- `sample_input.txt` (raw input lines for the CLI)
-
-One-line copy-paste (pipes into stdin, raw order):
+The UI drives inputs now. If you want to run a single request via CLI, populate `inputs.json` and run:
 
 ```bash
-Bengaluru, Karnataka, India
-12.9716
-77.5946
-12.2958
-76.6394
-60.0
-0.20
-0.10
-0.20
-50.0
-18.0
-25.0
-n
-20.0
+python3 main.py
 ```
+
+Example `inputs.json`:
+
+```json
+{
+  "src_lat": 12.9716,
+  "src_lon": 77.5946,
+  "dst_lat": 12.2958,
+  "dst_lon": 76.6394,
+  "src_name": "Bengaluru",
+  "dst_name": "Mysuru",
+  "current_soc": 0.3,
+  "temp_c": 28.0,
+  "wind_kmh": 10.0
+}
+```
+
+**Frontend Viewer**
+
+`index.html` calls the backend and renders:
+
+- A green route polyline
+- Green charger markers for each CHARGE event
+
+Run the backend server (serves the UI and handles routing):
+
+```bash
+python3 main.py --serve
+```
+
+Then open the UI:
+
+```bash
+open http://127.0.0.1:8000/index.html
+```
+
+Controls:
+
+- Source: auto-detected by GPS or enter a source name / click the map after focusing the Source input (yellow marker).
+- Destination: enter a destination name or click the map (red marker).
+- Battery: type % in the battery input.
+- Click **Go** to compute a route, render the polyline, and show charge markers with time labels.
+
+The backend writes:
+
+- `inputs.json` (latest request)
+- `route_output.json` (latest route for the UI)
+- cached graphs `graph_<source>_to_<dest>_rXXkm.graphml`
+
+Stopping the server:
+
+- Press `Ctrl+C` in the terminal.
+
+If you prefer a simple static server, you can still serve the folder locally:
+
+```bash
+python3 -m http.server 8000
+```
+
+Then open [http://localhost:8000/index.html](http://localhost:8000/index.html)
 
 **Current Limitations**
 
