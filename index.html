@@ -1,185 +1,185 @@
-<!DOCTYPE html>
+<!doctype html>
 <html>
-<head>
-<meta charset="utf-8"/>
-<title>EV Route Viewer</title>
+  <head>
+    <meta charset="utf-8" />
+    <title>EV Route Viewer</title>
 
-<style>
-body{
-    margin:0;
-    font-family:Arial;
-    background:#0f172a;
-    color:white;
-}
+    <style>
+      body {
+        margin: 0;
+        font-family: Arial;
+        background: #0f172a;
+        color: white;
+      }
 
-/* ---------- TOP BAR ---------- */
-.status-bar{
-    height:60px;
-    background:#111827;
-    display:flex;
-    align-items:center;
-    gap:10px;
-    padding:0 10px;
-}
+      /* ---------- TOP BAR ---------- */
+      .status-bar {
+        height: 60px;
+        background: #111827;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 0 10px;
+      }
 
-.badge{
-    background:#1f2937;
-    padding:6px 14px;
-    border-radius:8px;
-    font-size:14px;
-    min-width:150px;
-    text-align:center;
-    white-space:nowrap;
-}
+      .badge {
+        background: #1f2937;
+        padding: 6px 14px;
+        border-radius: 8px;
+        font-size: 14px;
+        min-width: 150px;
+        text-align: center;
+        white-space: nowrap;
+      }
 
-/* ---------- SEARCH (BADGE STYLE) ---------- */
-.search-badge{
-    background:#1f2937;
-    padding:4px 10px;
-    border-radius:8px;
-    min-width:150px;
-}
+      /* ---------- SEARCH (BADGE STYLE) ---------- */
+      .search-badge {
+        background: #1f2937;
+        padding: 4px 10px;
+        border-radius: 8px;
+        min-width: 150px;
+      }
 
-.search-badge input{
-    width:100%;
-    background:transparent;
-    border:none;
-    outline:none;
-    color:white;
-    font-size:14px;
-}
+      .search-badge input {
+        width: 100%;
+        background: transparent;
+        border: none;
+        outline: none;
+        color: white;
+        font-size: 14px;
+      }
 
-/* ---------- MAP ---------- */
-#map{
-    height:calc(100vh - 60px);
-    width:100%;
-}
-</style>
-</head>
+      /* ---------- MAP ---------- */
+      #map {
+        height: calc(100vh - 60px);
+        width: 100%;
+      }
+    </style>
+  </head>
 
-<body>
-
-<div class="status-bar">
-    <div class="badge">📍 <span id="sourceName">Detecting…</span></div>
-    <div class="badge">🎯 <span id="destName">--</span></div>
-    <div class="badge">🌤 <span id="weather">--</span></div>
-    <div class="badge">
+  <body>
+    <div class="status-bar">
+      <div class="badge">📍 <span id="sourceName">Detecting…</span></div>
+      <div class="badge">🎯 <span id="destName">--</span></div>
+      <div class="badge">🌤 <span id="weather">--</span></div>
+      <div class="badge">
         🔋 <span id="battery">--%</span>
         <input
-            id="batteryInput"
-            type="number"
-            min="1"
-            max="100"
-            step="1"
-            style="width:60px;margin-left:6px;background:transparent;border:none;outline:none;color:white;"
-            placeholder="%"
-            title="Battery %"
+          id="batteryInput"
+          type="number"
+          min="1"
+          max="100"
+          step="1"
+          style="
+            width: 60px;
+            margin-left: 6px;
+            background: transparent;
+            border: none;
+            outline: none;
+            color: white;
+          "
+          placeholder="%"
+          title="Battery %"
         />
-    </div>
+      </div>
 
-    <!-- SOURCE SEARCH -->
-    <div class="search-badge">
+      <!-- SOURCE SEARCH -->
+      <div class="search-badge">
         📍
-        <input
-            id="sourceInput"
-            type="text"
-            placeholder="Source (optional)"
-        />
-    </div>
+        <input id="sourceInput" type="text" placeholder="Source (optional)" />
+      </div>
 
-    <!-- DESTINATION SEARCH -->
-    <div class="search-badge">
+      <!-- DESTINATION SEARCH -->
+      <div class="search-badge">
         🎯
-        <input
-            id="searchInput"
-            type="text"
-            placeholder="Destination"
-        />
+        <input id="searchInput" type="text" placeholder="Destination" />
+      </div>
+      <div class="badge" style="cursor: pointer" id="goButton">Go</div>
     </div>
-    <div class="badge" style="cursor:pointer;" id="goButton">Go</div>
-</div>
 
-<div id="map"></div>
+    <div id="map"></div>
 
-<!-- Google Maps (map only) -->
-<script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyB5MI6BAOHfPVSBfeptIQiPZaBBUHMjMO4"></script>
+    <!-- Google Maps (map only) -->
+    <script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyB5MI6BAOHfPVSBfeptIQiPZaBBUHMjMO4"></script>
 
-<script>
-let map;
-let userMarker = null;
-let destMarker = null;
-let routePolyline = null;
-let chargerMarkers = [];
-let sourceCoord = null;
-let destCoord = null;
-let weatherSnapshot = null;
-let batteryLevel = 0.80;
-let sourceNameText = null;
-let destNameText = null;
-let carMarker = null;
-let animationTimer = null;
-let sourceFromClick = false;
+    <script>
+      let map;
+      let userMarker = null;
+      let destMarker = null;
+      let routePolyline = null;
+      let chargerMarkers = [];
+      let sourceCoord = null;
+      let destCoord = null;
+      let weatherSnapshot = null;
+      let batteryLevel = 0.8;
+      let sourceNameText = null;
+      let destNameText = null;
+      let carMarker = null;
+      let animationTimer = null;
+      let sourceFromClick = false;
+      let hoverInfo = null;
 
-/* ---------------------
+      /* ---------------------
    INIT MAP
 ---------------------*/
-function initMap(){
-    map = new google.maps.Map(document.getElementById("map"), {
-        center:{ lat:20.5937, lng:78.9629 },
-        zoom:6
-    });
+      function initMap() {
+        map = new google.maps.Map(document.getElementById("map"), {
+          center: { lat: 20.5937, lng: 78.9629 },
+          zoom: 6,
+        });
 
-    map.addListener("click", e => {
-        const sourceInput = document.getElementById("sourceInput");
-        const focusIsSource = sourceInput && document.activeElement === sourceInput;
-        if(focusIsSource || !sourceCoord){
+        map.addListener("click", (e) => {
+          const sourceInput = document.getElementById("sourceInput");
+          const focusIsSource =
+            sourceInput && document.activeElement === sourceInput;
+          if (focusIsSource || !sourceCoord) {
             setSource(e.latLng.lat(), e.latLng.lng(), true);
-        }else{
+          } else {
             setDestination(e.latLng.lat(), e.latLng.lng());
-        }
-    });
+          }
+        });
 
-    initSearch();
-    initBatteryInput();
-    detectSource();
-    getBattery();
-    loadRouteJson();
-    initGoButton();
-}
+        initSearch();
+        initBatteryInput();
+        detectSource();
+        getBattery();
+        loadRouteJson();
+        initGoButton();
+      }
 
-/* ---------------------
+      /* ---------------------
    SEARCH (TEXT → LAT/LNG)
 ---------------------*/
-function initSearch(){
-    const input = document.getElementById("searchInput");
-    const sourceInput = document.getElementById("sourceInput");
+      function initSearch() {
+        const input = document.getElementById("searchInput");
+        const sourceInput = document.getElementById("sourceInput");
 
-    input.addEventListener("keydown", async e => {
-        if(e.key !== "Enter") return;
+        input.addEventListener("keydown", async (e) => {
+          if (e.key !== "Enter") return;
 
-        const query = input.value.trim();
-        if(!query) return;
+          const query = input.value.trim();
+          if (!query) return;
 
-        const result = await searchPlace(query);
-        if(!result) return alert("Location not found");
+          const result = await searchPlace(query);
+          if (!result) return alert("Location not found");
 
-        const lat = parseFloat(result.lat);
-        const lng = parseFloat(result.lon);
+          const lat = parseFloat(result.lat);
+          const lng = parseFloat(result.lon);
 
-        setDestination(lat, lng);
-        map.setCenter({ lat, lng });
-        map.setZoom(14);
-    });
+          setDestination(lat, lng);
+          map.setCenter({ lat, lng });
+          map.setZoom(14);
+        });
 
-    if(sourceInput){
-        sourceInput.addEventListener("keydown", async e => {
-            if(e.key !== "Enter") return;
+        if (sourceInput) {
+          sourceInput.addEventListener("keydown", async (e) => {
+            if (e.key !== "Enter") return;
 
             const query = sourceInput.value.trim();
-            if(!query) return;
+            if (!query) return;
 
             const result = await searchPlace(query);
-            if(!result) return alert("Location not found");
+            if (!result) return alert("Location not found");
 
             const lat = parseFloat(result.lat);
             const lng = parseFloat(result.lon);
@@ -187,339 +187,391 @@ function initSearch(){
             setSource(lat, lng);
             map.setCenter({ lat, lng });
             map.setZoom(14);
+          });
+        }
+      }
+
+      function initGoButton() {
+        const btn = document.getElementById("goButton");
+        if (!btn) return;
+        btn.addEventListener("click", () => {
+          clearRoute();
+          planRoute();
         });
-    }
-}
+      }
 
-function initGoButton(){
-    const btn = document.getElementById("goButton");
-    if(!btn) return;
-    btn.addEventListener("click", () => {
-        clearRoute();
-        planRoute();
-    });
-}
-
-/* ---------------------
+      /* ---------------------
    OPENSTREETMAP SEARCH
 ---------------------*/
-async function searchPlace(query){
-    const url =
-        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}`;
+      async function searchPlace(query) {
+        const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}`;
 
-    const res = await fetch(url, {
-        headers:{ "User-Agent":"EV-Route-Viewer" }
-    });
-
-    const data = await res.json();
-    return data[0];
-}
-
-/* ---------------------
-   REVERSE GEOCODE (NAME)
----------------------*/
-async function getPlaceName(lat, lng){
-    const url =
-        `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}`;
-
-    const res = await fetch(url, {
-        headers:{ "User-Agent":"EV-Route-Viewer" }
-    });
-
-    const data = await res.json();
-
-    return (
-        data.address.city ||
-        data.address.town ||
-        data.address.village ||
-        data.address.county ||
-        data.address.state ||
-        "Unknown"
-    );
-}
-
-/* ---------------------
-   SOURCE (GPS)
----------------------*/
-function detectSource(){
-    if(!navigator.geolocation){
-        document.getElementById("sourceName").innerText="Unavailable";
-        return;
-    }
-
-    navigator.geolocation.getCurrentPosition(async pos=>{
-        const lat = pos.coords.latitude;
-        const lng = pos.coords.longitude;
-        sourceCoord = { lat, lng };
-
-        userMarker = new google.maps.Marker({
-            position:{ lat, lng },
-            map,
-            icon:"http://maps.google.com/mapfiles/ms/icons/blue-dot.png",
-            label:{
-                text:"S",
-                color:"#0f172a",
-                fontWeight:"700"
-            }
+        const res = await fetch(url, {
+          headers: { "User-Agent": "EV-Route-Viewer" },
         });
 
-        map.setCenter({ lat, lng });
-        map.setZoom(14);
+        const data = await res.json();
+        return data[0];
+      }
 
+      /* ---------------------
+   REVERSE GEOCODE (NAME)
+---------------------*/
+      async function getPlaceName(lat, lng) {
+        const url = `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}`;
+
+        const res = await fetch(url, {
+          headers: { "User-Agent": "EV-Route-Viewer" },
+        });
+
+        const data = await res.json();
+
+        return (
+          data.address.city ||
+          data.address.town ||
+          data.address.village ||
+          data.address.county ||
+          data.address.state ||
+          "Unknown"
+        );
+      }
+
+      /* ---------------------
+   SOURCE (GPS)
+---------------------*/
+      function detectSource() {
+        if (!navigator.geolocation) {
+          document.getElementById("sourceName").innerText = "Unavailable";
+          return;
+        }
+
+        navigator.geolocation.getCurrentPosition(async (pos) => {
+          const lat = pos.coords.latitude;
+          const lng = pos.coords.longitude;
+          sourceCoord = { lat, lng };
+
+          userMarker = new google.maps.Marker({
+            position: { lat, lng },
+            map,
+            icon: "http://maps.google.com/mapfiles/ms/icons/blue-dot.png",
+            label: {
+              text: "S",
+              color: "#0f172a",
+              fontWeight: "700",
+            },
+          });
+
+          map.setCenter({ lat, lng });
+          map.setZoom(14);
+
+          const place = await getPlaceName(lat, lng);
+          sourceNameText = place;
+          document.getElementById("sourceName").innerText = place;
+        });
+      }
+
+      async function setSource(lat, lng, fromClick = false) {
+        sourceCoord = { lat, lng };
+        sourceFromClick = !!fromClick;
+        if (userMarker) {
+          userMarker.setMap(null);
+        }
+        userMarker = new google.maps.Marker({
+          position: { lat, lng },
+          map,
+          icon: fromClick
+            ? "http://maps.google.com/mapfiles/ms/icons/yellow-dot.png"
+            : "http://maps.google.com/mapfiles/ms/icons/blue-dot.png",
+          label: {
+            text: "S",
+            color: "#0f172a",
+            fontWeight: "700",
+          },
+        });
         const place = await getPlaceName(lat, lng);
         sourceNameText = place;
         document.getElementById("sourceName").innerText = place;
-    });
-}
+      }
 
-async function setSource(lat, lng, fromClick=false){
-    sourceCoord = { lat, lng };
-    sourceFromClick = !!fromClick;
-    if(userMarker){
-        userMarker.setMap(null);
-    }
-    userMarker = new google.maps.Marker({
-        position:{ lat, lng },
-        map,
-        icon: fromClick
-            ? "http://maps.google.com/mapfiles/ms/icons/yellow-dot.png"
-            : "http://maps.google.com/mapfiles/ms/icons/blue-dot.png",
-        label:{
-            text:"S",
-            color:"#0f172a",
-            fontWeight:"700"
-        }
-    });
-    const place = await getPlaceName(lat, lng);
-    sourceNameText = place;
-    document.getElementById("sourceName").innerText = place;
-}
-
-/* ---------------------
+      /* ---------------------
    DESTINATION
 ---------------------*/
-async function setDestination(lat, lng){
-    if(destMarker){
-        destMarker.setMap(null);
-    }
+      async function setDestination(lat, lng) {
+        if (destMarker) {
+          destMarker.setMap(null);
+        }
 
-    destMarker = new google.maps.Marker({
-        position:{ lat, lng },
-        map,
-        icon:"http://maps.google.com/mapfiles/ms/icons/red-dot.png"
-    });
-    destCoord = { lat, lng };
+        destMarker = new google.maps.Marker({
+          position: { lat, lng },
+          map,
+          icon: "http://maps.google.com/mapfiles/ms/icons/red-dot.png",
+        });
+        destCoord = { lat, lng };
 
-    const place = await getPlaceName(lat, lng);
-    destNameText = place;
-    document.getElementById("destName").innerText = place;
+        const place = await getPlaceName(lat, lng);
+        destNameText = place;
+        document.getElementById("destName").innerText = place;
 
-    getWeather(lat, lng);
-}
+        getWeather(lat, lng);
+      }
 
-/* ---------------------
+      /* ---------------------
    ROUTE JSON (BACKEND OUTPUT)
 ---------------------*/
-async function loadRouteJson(){
-    try{
-        const res = await fetch("route_output.json", { cache:"no-store" });
-        if(!res.ok) return;
-        const data = await res.json();
-        renderRouteFromJson(data);
-    }catch(e){
-        console.warn("route_output.json not found or blocked.", e);
-    }
-}
+      async function loadRouteJson() {
+        try {
+          const res = await fetch("route_output.json", { cache: "no-store" });
+          if (!res.ok) return;
+          const data = await res.json();
+          renderRouteFromJson(data);
+        } catch (e) {
+          console.warn("route_output.json not found or blocked.", e);
+        }
+      }
 
-function clearRoute(){
-    if(routePolyline){
-        routePolyline.setMap(null);
-        routePolyline = null;
-    }
-    chargerMarkers.forEach(m => m.setMap(null));
-    chargerMarkers = [];
-    if(carMarker){
-        carMarker.setMap(null);
-        carMarker = null;
-    }
-    if(animationTimer){
-        clearTimeout(animationTimer);
-        animationTimer = null;
-    }
-}
+      function clearRoute() {
+        if (routePolyline) {
+          routePolyline.setMap(null);
+          routePolyline = null;
+        }
+        chargerMarkers.forEach((m) => m.setMap(null));
+        chargerMarkers = [];
+        if (carMarker) {
+          carMarker.setMap(null);
+          carMarker = null;
+        }
+        if (animationTimer) {
+          clearTimeout(animationTimer);
+          animationTimer = null;
+        }
+        if (hoverInfo) {
+          hoverInfo.close();
+          hoverInfo = null;
+        }
+      }
 
-function renderRouteFromJson(data){
-    if(!data || !data.route_coords || data.route_coords.length === 0) return;
+      function renderRouteFromJson(data) {
+        if (!data || !data.route_coords || data.route_coords.length === 0)
+          return;
 
-    clearRoute();
+        clearRoute();
 
-    const path = data.route_coords.map(([lat, lon]) => ({ lat, lng: lon }));
+        const path = data.route_coords.map(([lat, lon]) => ({ lat, lng: lon }));
 
-    routePolyline = new google.maps.Polyline({
-        path,
-        geodesic: true,
-        strokeColor: "#22c55e",
-        strokeOpacity: 0.9,
-        strokeWeight: 4
-    });
-    routePolyline.setMap(map);
+        routePolyline = new google.maps.Polyline({
+          path,
+          geodesic: true,
+          strokeColor: "#22c55e",
+          strokeOpacity: 0.9,
+          strokeWeight: 4,
+        });
+        routePolyline.setMap(map);
 
-    const bounds = new google.maps.LatLngBounds();
-    path.forEach(p => bounds.extend(p));
-    map.fitBounds(bounds);
+        const bounds = new google.maps.LatLngBounds();
+        path.forEach((p) => bounds.extend(p));
+        map.fitBounds(bounds);
 
-    if(Array.isArray(data.actions)){
-        data.actions.forEach(action => {
-            if(action[0] !== "CHARGE") return;
+        if (Array.isArray(data.actions)) {
+          data.actions.forEach((action) => {
+            if (action[0] !== "CHARGE") return;
             const coord = action[4];
-            if(!coord || coord.length !== 2) return;
+            if (!coord || coord.length !== 2) return;
             const [lat, lon] = coord;
             const marker = new google.maps.Marker({
-                position:{ lat, lng: lon },
-                map,
-                icon:"http://maps.google.com/mapfiles/ms/icons/green-dot.png",
-                title:`Charge: ${action[2].toFixed(1)} kWh, ${action[3].toFixed(1)} min`,
-                label:{
-                    text:`${action[3].toFixed(0)} min`,
-                    color:"#0f172a",
-                    fontWeight:"700"
-                }
+              position: { lat, lng: lon },
+              map,
+              icon: "http://maps.google.com/mapfiles/ms/icons/green-dot.png",
+              title: `Charge: ${action[2].toFixed(1)} kWh, ${action[3].toFixed(1)} min`,
+              label: {
+                text: `${action[3].toFixed(0)} min`,
+                color: "#0f172a",
+                fontWeight: "700",
+              },
             });
             const info = new google.maps.InfoWindow({
-                content:`<div style="color:#111827;font-family:Arial;">Charge: ${action[2].toFixed(1)} kWh<br/>Time: ${action[3].toFixed(1)} min</div>`
+              content: `<div style="color:#111827;font-family:Arial;">Charge: ${action[2].toFixed(1)} kWh<br/>Time: ${action[3].toFixed(1)} min</div>`,
             });
-            marker.addListener("click", () => info.open({ anchor: marker, map }));
+            marker.addListener("click", () =>
+              info.open({ anchor: marker, map }),
+            );
             chargerMarkers.push(marker);
-        });
-    }
+          });
+        }
 
-    animateRoute(data, path);
-}
+        animateRoute(data, path);
+        attachRouteHover(data, path);
+      }
 
-/* ---------------------
+      /* ---------------------
    WEATHER
 ---------------------*/
-async function getWeather(lat, lng){
-    const KEY = "c11a9adde900018627cd9c85dd2c4d22";
+      async function getWeather(lat, lng) {
+        const KEY = "c11a9adde900018627cd9c85dd2c4d22";
 
-    const res = await fetch(
-        `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lng}&units=metric&appid=${KEY}`
-    );
-    const w = await res.json();
+        const res = await fetch(
+          `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lng}&units=metric&appid=${KEY}`,
+        );
+        const w = await res.json();
 
-    document.getElementById("weather").innerText =
-        `${w.main.temp}°C ${w.weather[0].main}`;
-    weatherSnapshot = {
-        temp_c: w.main.temp,
-        wind_kmh: (w.wind && w.wind.speed ? w.wind.speed * 3.6 : null)
-    };
-}
+        document.getElementById("weather").innerText =
+          `${w.main.temp}°C ${w.weather[0].main}`;
+        weatherSnapshot = {
+          temp_c: w.main.temp,
+          wind_kmh: w.wind && w.wind.speed ? w.wind.speed * 3.6 : null,
+        };
+      }
 
-/* ---------------------
+      /* ---------------------
    BATTERY
 ---------------------*/
-async function getBattery(){
-    if(navigator.getBattery){
-        const b = await navigator.getBattery();
-        batteryLevel = b.level;
-        document.getElementById("battery").innerText =
-            Math.round(b.level*100)+"%";
-        const input = document.getElementById("batteryInput");
-        if(input && !input.value){
-            input.value = Math.round(b.level*100);
-        }
-    }else{
-        batteryLevel = 0.80;
-        document.getElementById("battery").innerText="80%";
-        const input = document.getElementById("batteryInput");
-        if(input && !input.value){
+      async function getBattery() {
+        if (navigator.getBattery) {
+          const b = await navigator.getBattery();
+          batteryLevel = b.level;
+          document.getElementById("battery").innerText =
+            Math.round(b.level * 100) + "%";
+          const input = document.getElementById("batteryInput");
+          if (input && !input.value) {
+            input.value = Math.round(b.level * 100);
+          }
+        } else {
+          batteryLevel = 0.8;
+          document.getElementById("battery").innerText = "80%";
+          const input = document.getElementById("batteryInput");
+          if (input && !input.value) {
             input.value = 80;
+          }
         }
-    }
-}
+      }
 
-/* ---------------------
+      /* ---------------------
    ROUTE ANIMATION
 ---------------------*/
-function animateRoute(data, path){
-    if(!path || path.length === 0) return;
+      function animateRoute(data, path) {
+        if (!path || path.length === 0) return;
 
-    if(!carMarker){
-        carMarker = new google.maps.Marker({
+        if (!carMarker) {
+          carMarker = new google.maps.Marker({
             position: path[0],
             map,
-            icon:"http://maps.google.com/mapfiles/ms/icons/blue-dot.png",
-            title:"EV"
-        });
-    }else{
-        carMarker.setPosition(path[0]);
-    }
+            icon: "http://maps.google.com/mapfiles/ms/icons/blue-dot.png",
+            title: "EV",
+          });
+        } else {
+          carMarker.setPosition(path[0]);
+        }
 
-    let i = 0;
-    const stepMs = 50;
+        let i = 0;
+        const stepMs = 50;
 
-    function tick(){
-        if(i >= path.length){
+        function tick() {
+          if (i >= path.length) {
             animationTimer = null;
             return;
+          }
+          carMarker.setPosition(path[i]);
+          i += 1;
+          animationTimer = setTimeout(tick, stepMs);
         }
-        carMarker.setPosition(path[i]);
-        i += 1;
-        animationTimer = setTimeout(tick, stepMs);
-    }
 
-    tick();
-}
+        tick();
+      }
 
-function initBatteryInput(){
-    const input = document.getElementById("batteryInput");
-    if(!input) return;
-    input.addEventListener("change", () => {
-        const v = parseFloat(input.value);
-        if(!isNaN(v) && v >= 1 && v <= 100){
+      function attachRouteHover(data, path) {
+        if (!routePolyline) return;
+        const socs = Array.isArray(data.route_soc) ? data.route_soc : [];
+        if (socs.length === 0) return;
+
+        if (!hoverInfo) {
+          hoverInfo = new google.maps.InfoWindow();
+        }
+
+        routePolyline.addListener("mousemove", (e) => {
+          const lat = e.latLng.lat();
+          const lng = e.latLng.lng();
+          let best = Infinity;
+          let idx = 0;
+          for (let i = 0; i < path.length; i++) {
+            const dLat = path[i].lat - lat;
+            const dLng = path[i].lng - lng;
+            const d = dLat * dLat + dLng * dLng;
+            if (d < best) {
+              best = d;
+              idx = i;
+            }
+          }
+          const socIdx =
+            socs.length === path.length
+              ? idx
+              : Math.round(
+                  (idx * (socs.length - 1)) / Math.max(path.length - 1, 1),
+                );
+          const raw = parseFloat(socs[socIdx]);
+          const pct = Number.isFinite(raw) ? Math.round(raw * 100) : null;
+          const text =
+            pct === null || Number.isNaN(pct)
+              ? "Predicted battery: --%"
+              : `Predicted battery: ${pct}%`;
+          hoverInfo.setContent(
+            `<div style="color:#111827;font-family:Arial;">${text}</div>`,
+          );
+          hoverInfo.setPosition(path[idx]);
+          hoverInfo.open({ map });
+        });
+        routePolyline.addListener("mouseout", () => {
+          if (hoverInfo) {
+            hoverInfo.close();
+          }
+        });
+      }
+      function initBatteryInput() {
+        const input = document.getElementById("batteryInput");
+        if (!input) return;
+        input.addEventListener("change", () => {
+          const v = parseFloat(input.value);
+          if (!isNaN(v) && v >= 1 && v <= 100) {
             batteryLevel = v / 100.0;
             document.getElementById("battery").innerText = `${Math.round(v)}%`;
-        }
-    });
-}
+          }
+        });
+      }
 
-/* ---------------------
+      /* ---------------------
    PLAN ROUTE (BACKEND)
 ---------------------*/
-async function planRoute(){
-    if(!sourceCoord || !destCoord) return;
+      async function planRoute() {
+        if (!sourceCoord || !destCoord) return;
 
-    const payload = {
-        src_lat: sourceCoord.lat,
-        src_lon: sourceCoord.lng,
-        dst_lat: destCoord.lat,
-        dst_lon: destCoord.lng,
-        src_name: sourceNameText,
-        dst_name: destNameText,
-        current_soc: batteryLevel,
-        temp_c: weatherSnapshot ? weatherSnapshot.temp_c : null,
-        wind_kmh: weatherSnapshot ? weatherSnapshot.wind_kmh : null
-    };
+        const payload = {
+          src_lat: sourceCoord.lat,
+          src_lon: sourceCoord.lng,
+          dst_lat: destCoord.lat,
+          dst_lon: destCoord.lng,
+          src_name: sourceNameText,
+          dst_name: destNameText,
+          current_soc: batteryLevel,
+          temp_c: weatherSnapshot ? weatherSnapshot.temp_c : null,
+          wind_kmh: weatherSnapshot ? weatherSnapshot.wind_kmh : null,
+        };
 
-    try{
-        const res = await fetch("/api/route", {
+        try {
+          const res = await fetch("/api/route", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
-        });
-        if(!res.ok) return;
-        const data = await res.json();
-        renderRouteFromJson(data);
-    }catch(e){
-        console.warn("Route request failed.", e);
-    }
-}
+            body: JSON.stringify(payload),
+          });
+          if (!res.ok) return;
+          const data = await res.json();
+          renderRouteFromJson(data);
+        } catch (e) {
+          console.warn("Route request failed.", e);
+        }
+      }
 
-/* ---------------------
+      /* ---------------------
    START
 ---------------------*/
-initMap();
-</script>
-
-</body>
+      initMap();
+    </script>
+  </body>
 </html>

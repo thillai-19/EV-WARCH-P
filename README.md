@@ -3,8 +3,7 @@ EV-Winter Aware Routing with Charger-Health Prediction (India)
 
 **Overview**
 
-This project is an experimental Electric Vehicle (EV) route-planning system designed for long-distance and inter-city travel in India.
-Unlike conventional shortest-path routing, the system incorporates battery State of Charge (SOC), charging infrastructure, and uncertainty in charger reliability to compute risk-aware routes.
+This project is an experimental Electric Vehicle (EV) route-planning system designed for long-distance and inter-city travel in India. Unlike conventional shortest-path routing, the system incorporates battery State of Charge (SOC), charging infrastructure, and uncertainty in charger reliability to compute risk-aware routes.
 
 The objective is to move toward more realistic EV navigation by accounting for range constraints, charging availability, weather-dependent energy consumption, and failure risk.
 
@@ -16,6 +15,7 @@ The objective is to move toward more realistic EV navigation by accounting for r
 - Weather-aware energy consumption modeling (HVAC and wind effects)
 - Route output includes detailed per-edge DRIVE actions and CHARGE events
 - Route coordinates are exported to `route_output.json` for external map rendering
+- Predicted SOC per route node is exported as `route_soc` for hover display
 
 **Technology Stack**
 
@@ -63,6 +63,7 @@ Example `inputs.json`:
 
 - A green route polyline
 - Green charger markers for each CHARGE event
+- Hover shows predicted battery percentage along the route
 
 Run the backend server (serves the UI and handles routing):
 
@@ -99,21 +100,18 @@ If you prefer a simple static server, you can still serve the folder locally:
 python3 -m http.server 8000
 ```
 
-Then open [http://localhost:8000/index.html](http://localhost:8000/index.html)
+Then open `http://localhost:8000/index.html`.
 
 **Current Limitations**
 
 - Long-distance graphs may still take time to build on first run
 - Charger selection is single-stop (one charge) in the current routing mode
-- External map visualization requires consuming `route_output.json`
 
 **Planned Improvements**
 
 - Multi-stop charging for very long routes
-- Improved charger discovery along the entire route
 - Performance optimization for long inter-state routes
 - Route visualization and SOC profiling
-- Integration of live charger availability data
 
 **Motivation**
 

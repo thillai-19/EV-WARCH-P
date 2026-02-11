@@ -25,7 +25,7 @@ class VehicleSpec:
     battery_kwh: float = 60.0
     base_kwh_per_km: float = 0.16          # nominal traction (adjust as needed)
     min_soc_reserve: float = 0.10          # reserve SOC (10%)
-    max_soc: float = 0.90                  # stop charging at 90% for speed
+    max_soc: float = 1.00                  # stop charging at 100%
     charge_power_kw: float = 50.0          # assumed DCFC power for prototype
     target_cabin_temp_c: float = 22.0
     current_soc: float = 0.80              # start SOC (0.0 - 1.0)
@@ -263,6 +263,15 @@ def plan_single_charge_route(
             actions.append(("DRIVE", u, v, dist_km))
         return actions
 
+    def battery_profile_for_nodes(nodes: List[int], start_soc: float) -> List[float]:
+        socs = [float(np.clip(start_soc, 0.0, 1.0))]
+        cur_kwh = vehicle.battery_kwh * socs[0]
+        for i in range(len(nodes) - 1):
+            dist_km = edge_length_km(nodes[i], nodes[i + 1])
+            cur_kwh -= dist_km * kwh_per_km
+            socs.append(float(np.clip(cur_kwh / vehicle.battery_kwh, 0.0, 1.0)))
+        return socs
+
     if dist_src_to_target_km <= range_km:
         time_min = (time_from_source.get(target_node, 0.0) or 0.0) / 60.0
         nodes = route_nodes(source_node, target_node)
@@ -273,6 +282,7 @@ def plan_single_charge_route(
             "actions": drive_actions,
             "route_nodes": nodes,
             "route_coords": nodes_to_coords(nodes),
+            "route_soc": battery_profile_for_nodes(nodes, start_soc),
         }
 
     if chargers_df.empty:
@@ -341,12 +351,19 @@ def plan_single_charge_route(
     )
 
     charge_action = ("CHARGE", best["charger_node"], best["add_kwh"], charge_time_min, charge_coord)
+    start_soc = float(np.clip(vehicle.current_soc, 0.0, 1.0))
+    soc_a = battery_profile_for_nodes(nodes_a, start_soc)
+    soc_at_charge = soc_a[-1] if soc_a else start_soc
+    soc_after_charge = vehicle.max_soc
+    soc_b = battery_profile_for_nodes(nodes_b, soc_after_charge)
+    full_soc = soc_a + (soc_b[1:] if soc_b else [])
     return {
         "ok": True,
         "cost_minutes": best["cost_minutes"],
         "actions": drive_actions_a + [charge_action] + drive_actions_b,
         "route_nodes": full_nodes,
         "route_coords": full_coords,
+        "route_soc": full_soc,
     }
 
 
@@ -452,10 +469,27 @@ def run_route(
         print("Routing failed:", result.get("reason"))
 
     if result.get("ok"):
+        if "route_soc" not in result or not result.get("route_soc"):
+            # Fallback: compute SOC from actions if missing
+            kwh_per_km = compute_kwh_per_km(temp_c, wind_kmh, vehicle)
+            reserve_kwh = vehicle.battery_kwh * vehicle.min_soc_reserve
+            cur_kwh = vehicle.battery_kwh * float(np.clip(vehicle.current_soc, 0.0, 1.0))
+            socs = [float(np.clip(cur_kwh / vehicle.battery_kwh, 0.0, 1.0))]
+            for act in result.get("actions", []):
+                if act[0] == "DRIVE":
+                    dist_km = float(act[3])
+                    cur_kwh -= dist_km * kwh_per_km
+                    socs.append(float(np.clip(cur_kwh / vehicle.battery_kwh, 0.0, 1.0)))
+                elif act[0] == "CHARGE":
+                    cur_kwh = vehicle.battery_kwh * vehicle.max_soc
+                    socs.append(float(np.clip(cur_kwh / vehicle.battery_kwh, 0.0, 1.0)))
+            result["route_soc"] = socs
+
         route_out = _sanitize_json(
             {
                 "route_coords": result.get("route_coords", []),
                 "actions": result.get("actions", []),
+                "route_soc": result.get("route_soc", []),
                 "meta": {
                     "src": [src_lat, src_lon],
                     "dst": [dst_lat, dst_lon],
@@ -694,6 +728,7 @@ def main():
         route_out = {
             "route_coords": result["route_coords"],
             "actions": result["actions"],
+            "route_soc": result.get("route_soc", []),
         }
         with open(os.path.join(BASE_DIR, "route_output.json"), "w", encoding="utf-8") as f:
             json.dump(route_out, f, ensure_ascii=False)
