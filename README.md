@@ -1,118 +1,166 @@
 # EV-WARCH-P
+
 EV-Winter Aware Routing with Charger-Health Prediction (India)
 
-**Overview**
+## Overview
 
-This project is an experimental Electric Vehicle (EV) route-planning system designed for long-distance and inter-city travel in India. Unlike conventional shortest-path routing, the system incorporates battery State of Charge (SOC), charging infrastructure, and uncertainty in charger reliability to compute risk-aware routes.
+EV-WARCH-P is an experimental Electric Vehicle (EV) route-planning system designed for long-distance and inter-city travel in India.
 
-The objective is to move toward more realistic EV navigation by accounting for range constraints, charging availability, weather-dependent energy consumption, and failure risk.
+Unlike conventional shortest-path routing, the system considers:
 
-**Key Features**
+- Battery State of Charge (SOC)
+- Minimum battery reserve
+- Charging station availability
+- Weather-dependent energy consumption
+- Dynamic Wireless Power Transfer (DWPT)
+- Charging time and route feasibility
 
-- Road network generation using OpenStreetMap data via OSMnx (point-radius graph build with caching)
-- SOC-aware range checks with battery reserve constraints
-- Charging station integration using the OpenChargeMap API
-- Weather-aware energy consumption modeling (HVAC and wind effects)
-- Route output includes detailed per-edge DRIVE actions and CHARGE events
-- Route coordinates are exported to `route_output.json` for external map rendering
-- Predicted SOC per route node is exported as `route_soc` for hover display
+The goal is to make EV routing more practical by considering real-world battery and charging constraints rather than distance alone.
 
-**Technology Stack**
+## Key Features
+
+- Road network generation using OpenStreetMap data via OSMnx
+- Cached road graphs for faster repeated routing
+- SOC-aware routing with configurable battery reserve
+- Automatic charger discovery using the OpenChargeMap API
+- Charger-to-road-node mapping for route planning
+- Weather-aware energy consumption using temperature and wind
+- Single-stop charging route planning
+- Dynamic Wireless Power Transfer (DWPT) modeling
+- Per-edge battery/SOC simulation along the route
+- Detailed `DRIVE` and `CHARGE` route actions
+- Predicted SOC exported as `route_soc`
+- Route coordinates exported as `route_coords`
+- Interactive route and charging visualization in the frontend
+
+## How the Routing Works
+
+The routing engine first determines whether the destination can be reached while maintaining the required battery reserve.
+
+If charging is required, reachable charging stations are evaluated based on:
+
+- Distance from the source
+- Distance to the destination
+- Energy required for each leg
+- Available DWPT energy
+- Required charging energy
+- Estimated charging time
+
+The charger producing the lowest total travel + charging time is selected.
+
+The battery profile is then calculated along the route, accounting for energy consumed while driving and energy gained from DWPT segments.
+
+## Weather-Aware Energy Model
+
+Weather conditions influence the estimated energy consumption of the vehicle.
+
+The model considers:
+
+- Ambient temperature
+- Wind speed
+- HVAC energy requirements
+- Base vehicle energy consumption
+
+This produces a dynamic `kWh/km` estimate instead of assuming a fixed driving range.
+
+## Dynamic Wireless Power Transfer (DWPT)
+
+EV-WARCH-P supports experimental modeling of wireless charging roads.
+
+DWPT segments can provide energy while the vehicle is driving. The system distributes the configured DWPT distance across the route and calculates the resulting energy gain.
+
+The frontend visualizes DWPT road segments separately and provides an impact summary showing charging time and energy differences.
+
+## Technology Stack
 
 - Python
 - OSMnx and NetworkX for road graphs and routing
 - OpenChargeMap API for charging station data
-- Open-Meteo API for live weather information
+- Open-Meteo API for weather information
 - NumPy and Pandas for data processing
+- Google Maps JavaScript API for frontend visualization
 
-**Example Use Case**
+## Example Use Case
 
-Routing an EV trip from Vijayawada to Hyderabad while ensuring:
+Routing an EV trip between Indian cities while ensuring:
 
 - Minimum SOC reserve is maintained
-- Charging stops are considered when required
-- Total travel cost accounts for both time and charging risk
+- The vehicle can reach the selected charger
+- Charging requirements are calculated dynamically
+- Weather affects estimated energy consumption
+- DWPT can contribute energy while driving
+- The final route includes predicted SOC information
 
-**Sample Input**
+## Frontend Viewer
 
-The UI drives inputs now. If you want to run a single request via CLI, populate `inputs.json` and run:
+`index.html` provides an interactive map-based route viewer.
 
-```bash
-python3 main.py
-```
+It displays:
 
-Example `inputs.json`:
+- Route polyline
+- Source and destination markers
+- Charging-stop markers
+- Predicted charging time
+- Predicted battery percentage when hovering over the route
+- DWPT road segments
+- DWPT impact summary
 
-```json
-{
-  "src_lat": 12.9716,
-  "src_lon": 77.5946,
-  "dst_lat": 12.2958,
-  "dst_lon": 76.6394,
-  "src_name": "Bengaluru",
-  "dst_name": "Mysuru",
-  "current_soc": 0.3,
-  "temp_c": 28.0,
-  "wind_kmh": 10.0
-}
-```
+## Running the Project
 
-**Frontend Viewer**
-
-`index.html` calls the backend and renders:
-
-- A green route polyline
-- Green charger markers for each CHARGE event
-- Hover shows predicted battery percentage along the route
-
-Run the backend server (serves the UI and handles routing):
+Start the backend and frontend:
 
 ```bash
 python3 main.py --serve
 ```
 
-Then open the UI:
+Then open:
 
-```bash
-open http://127.0.0.1:8000/index.html
+```text
+http://127.0.0.1:8000/index.html
 ```
 
-Controls:
+## Controls
 
-- Source: auto-detected by GPS or enter a source name / click the map after focusing the Source input (yellow marker).
-- Destination: enter a destination name or click the map (red marker).
-- Battery: type % in the battery input.
-- Click **Go** to compute a route, render the polyline, and show charge markers with time labels.
+- **Source:** Automatically detected using GPS, entered by name, or selected on the map
+- **Destination:** Enter a location or select it on the map
+- **Battery:** Set the current battery percentage
+- **DWPT km:** Configure the amount of wireless-charging road available
+- **Go:** Calculate and display the route
 
-The backend writes:
+## Output
 
-- `inputs.json` (latest request)
-- `route_output.json` (latest route for the UI)
-- cached graphs `graph_<source>_to_<dest>_rXXkm.graphml`
+The backend generates:
 
-Stopping the server:
+- `inputs.json` — latest routing request
+- `route_output.json` — route data used by the frontend
+- Cached GraphML files — reusable road networks
 
-- Press `Ctrl+C` in the terminal.
+The route output contains:
 
-If you prefer a simple static server, you can still serve the folder locally:
+- `route_coords`
+- `route_soc`
+- `actions`
+- `dwpt_road_coords`
+- DWPT and charging metadata
 
-```bash
-python3 -m http.server 8000
-```
+## Current Limitations
 
-Then open `http://localhost:8000/index.html`.
+- Long-distance road graphs may take time to build on the first run
+- Current routing supports a single charging stop
+- DWPT segment locations are modeled rather than obtained from a real infrastructure dataset
+- Charger reliability/health prediction is currently experimental and can be extended with historical charger performance data
 
-**Current Limitations**
-
-- Long-distance graphs may still take time to build on first run
-- Charger selection is single-stop (one charge) in the current routing mode
-
-**Planned Improvements**
+## Planned Improvements
 
 - Multi-stop charging for very long routes
-- Performance optimization for long inter-state routes
-- Route visualization and SOC profiling
+- More efficient routing for long inter-state trips
+- Real charger-health/failure prediction using historical data
+- Improved weather forecasting along the complete route
+- More detailed SOC and energy visualizations
+- Integration of real DWPT infrastructure data
 
-**Motivation**
+## Motivation
 
-This project explores realistic EV routing under real-world constraints, particularly in regions with limited and variable charging infrastructure. It aims to bridge the gap between theoretical shortest-path routing and practical EV travel planning.
+EV-WARCH-P explores how EV navigation can move beyond shortest-path routing toward practical, constraint-aware travel planning.
+
+By combining road networks, battery SOC, charging infrastructure, weather effects, and emerging technologies such as DWPT, the project aims to build a more realistic EV routing system for long-distance travel in India.

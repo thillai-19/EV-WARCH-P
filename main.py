@@ -17,6 +17,21 @@ OCM_API_KEY = os.environ.get("OPENCHARGEMAP_API_KEY")
 DEFAULT_OCM_API_KEY = "86ff4b4a-e7f8-42bd-a259-0f326f4a8d83"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+DWPT_POWER_KW   = 20.0   # Realistic wireless charging power (ElectReon/eRoadArlanda spec)
+DWPT_SPEED_KMH  = 40.0   # Speed limit on DWPT road segments
+OVERPASS_ENDPOINTS = [
+    url
+    for url in dict.fromkeys(
+        [
+            os.environ.get("OVERPASS_URL", "").strip(),
+            "https://overpass-api.de/api",
+            "https://lz4.overpass-api.de/api",
+            "https://z.overpass-api.de/api",
+        ]
+    )
+    if url
+]
+
 # ----------------------------
 # Configuration dataclasses
 # ----------------------------
@@ -174,6 +189,38 @@ def compute_kwh_per_km(temp_c: float, wind_kmh: float, vehicle: VehicleSpec) -> 
     hvac_term = hvac_kwh_per_km(temp_c, wind_kmh, vehicle.target_cabin_temp_c)
     return vehicle.base_kwh_per_km + hvac_term
 
+def build_dwpt_schedule(total_route_km: float, dwpt_km: float) -> list:
+    """
+    Scatter dwpt_km across the route in equal chunks with random 10-15km gaps.
+    Returns a list of (start_km, end_km) tuples representing DWPT active segments.
+    One chunk per 50km of route. If route too short, fit as many as possible.
+    """
+    import random
+    if dwpt_km <= 0.0 or total_route_km <= 0.0:
+        return []
+
+    # auto-calculate number of chunks based on route length
+    num_chunks = max(1, int(total_route_km / 50.0))
+    chunk_size_km = dwpt_km / num_chunks
+
+    segments = []
+    cursor_km = 5.0  # start first chunk 5km into the route (not at the very start)
+
+    for i in range(num_chunks):
+        start_km = cursor_km
+        end_km = start_km + chunk_size_km
+
+        # if this chunk goes beyond the route, stop here
+        if start_km >= total_route_km:
+            break
+        end_km = min(end_km, total_route_km)
+        segments.append((start_km, end_km))
+
+        # random gap of 10-15km before next chunk
+        gap_km = random.uniform(10.0, 15.0)
+        cursor_km = end_km + gap_km
+
+    return segments
 
 def _slugify(name: str) -> str:
     keep = []
@@ -200,6 +247,29 @@ def cache_key(lat1, lon1, lat2, lon2, buffer_km, src_name=None, dst_name=None):
     return f"graph_mid_{mid_lat:.2f}_{mid_lon:.2f}_r{buffer_bucket}km.graphml"
 
 
+def load_or_build_graph(cache_path: str, center_lat: float, center_lon: float, dist_m: int):
+    if os.path.exists(cache_path):
+        return ox.load_graphml(cache_path)
+
+    last_error = None
+    ox.settings.requests_timeout = max(getattr(ox.settings, "requests_timeout", 180), 180)
+    for endpoint in OVERPASS_ENDPOINTS:
+        try:
+            ox.settings.overpass_url = endpoint
+            print(f"Trying Overpass endpoint: {endpoint}")
+            G = ox.graph_from_point((center_lat, center_lon), dist=dist_m, network_type="drive")
+            G = ox.add_edge_speeds(G)
+            G = ox.add_edge_travel_times(G)
+            ox.save_graphml(G, cache_path)
+            print(f"Graph saved to {cache_path}")
+            return G
+        except Exception as e:
+            last_error = e
+            print(f"Overpass endpoint failed: {endpoint} ({e})", file=sys.stderr)
+
+    raise RuntimeError(f"Unable to download road graph from Overpass: {last_error}")
+
+
 def plan_single_charge_route(
     G: nx.MultiDiGraph,
     source_node: int,
@@ -208,17 +278,44 @@ def plan_single_charge_route(
     temp_c: float,
     wind_kmh: float,
     vehicle: VehicleSpec,
+    dwpt_km: float = 0.0,
+    verbose: bool = True,
 ) -> Dict:
     """
     Plan: if destination is within current range, go direct.
     Otherwise, find all reachable chargers and pick the optimal one
     (shortest total distance) then drive -> charge -> drive.
+
+    dwpt_km: total km of Dynamic Wireless Power Transfer road along the route.
+    Since we only know the total DWPT distance and not the exact segments, we
+    model it as being encountered progressively from the start of the route.
     """
-    kwh_per_km = compute_kwh_per_km(temp_c, wind_kmh, vehicle)
-    reserve_kwh = vehicle.battery_kwh * vehicle.min_soc_reserve
-    current_kwh = vehicle.battery_kwh * float(np.clip(vehicle.current_soc, 0.0, 1.0))
-    usable_kwh = max(current_kwh - reserve_kwh, 0.0)
-    range_km = usable_kwh / max(kwh_per_km, 1e-9)
+    def log(message: str) -> None:
+        if verbose:
+            print(message)
+
+    # --- Core vehicle energy variables (must be defined first) ---
+    kwh_per_km   = compute_kwh_per_km(temp_c, wind_kmh, vehicle)
+    reserve_kwh  = vehicle.battery_kwh * vehicle.min_soc_reserve
+    start_kwh    = vehicle.battery_kwh * float(np.clip(vehicle.current_soc, 0.0, 1.0))
+    max_soc_kwh  = vehicle.max_soc * vehicle.battery_kwh
+
+    # --- DWPT energy-rate constant ---
+    dwpt_km          = max(dwpt_km, 0.0)
+    dwpt_kwh_per_km  = DWPT_POWER_KW / max(DWPT_SPEED_KMH, 1e-9)   # kWh per km at 40 km/h
+    dwpt_kwh_gained  = dwpt_km * dwpt_kwh_per_km                    # theoretical max gain
+
+    log(
+        f"DWPT: {dwpt_km:.1f} km available "
+        f"→ up to +{dwpt_kwh_gained:.2f} kWh while driving (scattered chunks)"
+    )
+
+    # Base range from actual SOC — DWPT credit applied per-edge later
+    base_usable_kwh = max(start_kwh - reserve_kwh, 0.0)
+    range_km        = base_usable_kwh / max(kwh_per_km, 1e-9)
+
+    # DWPT schedule built after first pass gives us total_route_km
+    dwpt_segments = []
 
     len_from_source = nx.single_source_dijkstra_path_length(G, source_node, weight="length")
     if target_node not in len_from_source:
@@ -228,8 +325,8 @@ def plan_single_charge_route(
     time_from_source = nx.single_source_dijkstra_path_length(G, source_node, weight="travel_time")
     time_to_target = nx.single_source_dijkstra_path_length(G.reverse(copy=False), target_node, weight="travel_time")
 
-    print(f"Estimated range from current SOC: {range_km:.2f} km")
-    print(f"Shortest path distance (source -> destination): {dist_src_to_target_km:.2f} km")
+    log(f"Estimated range from current SOC: {range_km:.2f} km")
+    log(f"Shortest path distance (source -> destination): {dist_src_to_target_km:.2f} km")
 
     def route_nodes(u: int, v: int) -> List[int]:
         if u == v:
@@ -263,26 +360,135 @@ def plan_single_charge_route(
             actions.append(("DRIVE", u, v, dist_km))
         return actions
 
-    def battery_profile_for_nodes(nodes: List[int], start_soc: float) -> List[float]:
-        socs = [float(np.clip(start_soc, 0.0, 1.0))]
-        cur_kwh = vehicle.battery_kwh * socs[0]
+    def battery_profile_for_nodes(nodes: List[int], start_kwh_value: float, dwpt_segments: list, leg_offset_km: float = 0.0) -> Dict:
+        """
+        dwpt_segments: list of (start_km, end_km) tuples from build_dwpt_schedule
+                       these are absolute positions from route start.
+        leg_offset_km: how many km into the full route this leg starts at.
+        """
+        cur_kwh = float(np.clip(start_kwh_value, 0.0, max_soc_kwh))
+        socs = [float(np.clip(cur_kwh / vehicle.battery_kwh, 0.0, 1.0))]
+        gained_kwh = 0.0
+        distance_km = 0.0
+
         for i in range(len(nodes) - 1):
             dist_km = edge_length_km(nodes[i], nodes[i + 1])
-            cur_kwh -= dist_km * kwh_per_km
-            socs.append(float(np.clip(cur_kwh / vehicle.battery_kwh, 0.0, 1.0)))
-        return socs
+            edge_start = leg_offset_km + distance_km
+            edge_end = edge_start + dist_km
 
-    if dist_src_to_target_km <= range_km:
+            # check overlap of this edge with every DWPT segment
+            dwpt_on_edge_km = 0.0
+            for seg_start, seg_end in dwpt_segments:
+                overlap_start = max(edge_start, seg_start)
+                overlap_end = min(edge_end, seg_end)
+                if overlap_end > overlap_start:
+                    dwpt_on_edge_km += overlap_end - overlap_start
+
+            gained_here_kwh = dwpt_on_edge_km * dwpt_kwh_per_km
+            cur_kwh = min(cur_kwh + gained_here_kwh, max_soc_kwh)
+            cur_kwh = max(cur_kwh - dist_km * kwh_per_km, 0.0)
+            gained_kwh += gained_here_kwh
+            distance_km += dist_km
+            socs.append(float(np.clip(cur_kwh / vehicle.battery_kwh, 0.0, 1.0)))
+
+        return {
+            "socs": socs,
+            "end_kwh": cur_kwh,
+            "dwpt_gained_kwh": gained_kwh,
+            "distance_km": distance_km,
+        }
+
+    direct_nodes = route_nodes(source_node, target_node)
+
+    # first pass with no DWPT to get total route distance
+    bare_profile = battery_profile_for_nodes(direct_nodes, start_kwh, [], 0.0)
+    total_route_km = bare_profile["distance_km"]
+
+    # now build scattered DWPT schedule based on real route length
+    dwpt_segments = build_dwpt_schedule(total_route_km, dwpt_km)
+    log(f"DWPT schedule: {len(dwpt_segments)} chunks across {total_route_km:.1f} km route")
+    for seg in dwpt_segments:
+        log(f"  DWPT active: {seg[0]:.1f} km – {seg[1]:.1f} km")
+
+    def dwpt_coords_from_nodes(nodes: List[int], seg_list: list, leg_offset_km: float = 0.0) -> List[List[List[float]]]:
+        """
+        Convert DWPT segment km-positions into lists of [lat, lon] coordinate
+        sequences that can be drawn as polylines on the map.
+
+        Returns a list of segments, each segment being a list of [lat, lon] pairs.
+        """
+        if not seg_list:
+            return []
+
+        # Walk every edge, accumulate cumulative distance, collect coords for
+        # any portion of an edge that overlaps a DWPT segment.
+        result_segments: List[List[List[float]]] = []
+        cursor_km = leg_offset_km
+
+        for i in range(len(nodes) - 1):
+            u = nodes[i]
+            v = nodes[i + 1]
+            dist_km = edge_length_km(u, v)
+            edge_start = cursor_km
+            edge_end   = cursor_km + dist_km
+
+            u_lat = float(G.nodes[u]["y"])
+            u_lon = float(G.nodes[u]["x"])
+            v_lat = float(G.nodes[v]["y"])
+            v_lon = float(G.nodes[v]["x"])
+
+            for seg_start, seg_end in seg_list:
+                overlap_start = max(edge_start, seg_start)
+                overlap_end   = min(edge_end,   seg_end)
+                if overlap_end <= overlap_start:
+                    continue
+
+                # Interpolate start/end coords along the edge
+                if dist_km < 1e-9:
+                    t_start, t_end = 0.0, 1.0
+                else:
+                    t_start = (overlap_start - edge_start) / dist_km
+                    t_end   = (overlap_end   - edge_start) / dist_km
+
+                p_start_lat = u_lat + t_start * (v_lat - u_lat)
+                p_start_lon = u_lon + t_start * (v_lon - u_lon)
+                p_end_lat   = u_lat + t_end   * (v_lat - u_lat)
+                p_end_lon   = u_lon + t_end   * (v_lon - u_lon)
+
+                # Try to merge with the last segment if it's the same DWPT band
+                # and we're on consecutive edges (gap < 0.001 km)
+                if result_segments:
+                    last_seg = result_segments[-1]
+                    last_pt  = last_seg[-1]
+                    gap = abs(last_pt[0] - p_start_lat) + abs(last_pt[1] - p_start_lon)
+                    if gap < 0.0001:          # ~10 m — same continuous segment
+                        last_seg.append([p_end_lat, p_end_lon])
+                        continue
+
+                result_segments.append([
+                    [p_start_lat, p_start_lon],
+                    [p_end_lat,   p_end_lon],
+                ])
+
+            cursor_km = edge_end
+
+        return result_segments
+
+    direct_profile = battery_profile_for_nodes(direct_nodes, start_kwh, dwpt_segments, 0.0)
+    if direct_profile["end_kwh"] >= reserve_kwh:
         time_min = (time_from_source.get(target_node, 0.0) or 0.0) / 60.0
-        nodes = route_nodes(source_node, target_node)
-        drive_actions = drive_actions_from_nodes(nodes)
+        drive_actions = drive_actions_from_nodes(direct_nodes)
+        dwpt_road_coords = dwpt_coords_from_nodes(direct_nodes, dwpt_segments, 0.0)
         return {
             "ok": True,
             "cost_minutes": time_min,
             "actions": drive_actions,
-            "route_nodes": nodes,
-            "route_coords": nodes_to_coords(nodes),
-            "route_soc": battery_profile_for_nodes(nodes, start_soc),
+            "route_nodes": direct_nodes,
+            "route_coords": nodes_to_coords(direct_nodes),
+            "route_soc": direct_profile["socs"],
+            "dwpt_kwh_gained": direct_profile["dwpt_gained_kwh"],
+            "dwpt_segments": dwpt_segments,
+            "dwpt_road_coords": dwpt_road_coords,
         }
 
     if chargers_df.empty:
@@ -290,15 +496,27 @@ def plan_single_charge_route(
 
     len_to_target = nx.single_source_dijkstra_path_length(G.reverse(copy=False), target_node, weight="length")
 
-    max_soc_kwh = vehicle.max_soc * vehicle.battery_kwh
-    usable_kwh_after = max(max_soc_kwh - reserve_kwh, 0.0)
-    range_after_km = usable_kwh_after / max(kwh_per_km, 1e-9)
-
     best = None
     charger_nodes = chargers_df["graph_node"].dropna().astype(int).tolist()
 
-    # Minimum distance from start before allowing a charge stop. Adjust or remove as needed.
+    # Minimum distance from start before allowing a charge stop.
     min_dist_from_start_km = 1.0
+
+    # Helper: total DWPT kWh collected on a leg that spans [leg_start_km, leg_start_km+leg_dist_km]
+    # of the full route.  Defined once here — not inside the loop.
+    def kwh_from_segments_on_leg(seg_list, leg_start_km, leg_dist_km):
+        gained = 0.0
+        leg_end_km = leg_start_km + leg_dist_km
+        for seg_start, seg_end in seg_list:
+            overlap_start = max(leg_start_km, seg_start)
+            overlap_end   = min(leg_end_km,   seg_end)
+            if overlap_end > overlap_start:
+                gained += (overlap_end - overlap_start) * dwpt_kwh_per_km
+        return gained
+
+    # Safe default: used on line 505 even if charger loop never executes
+    dwpt_gained_leg2 = 0.0
+
     for c in charger_nodes:
         if c not in len_from_source or c not in len_to_target:
             continue
@@ -306,16 +524,25 @@ def plan_single_charge_route(
         dist2_km = len_to_target[c] / 1000.0
         if dist1_km <= min_dist_from_start_km:
             continue
-        if dist1_km > range_km:
-            continue
-        if dist2_km > range_after_km:
-            continue
-
         time1_min = (time_from_source.get(c, 0.0) or 0.0) / 60.0
         time2_min = (time_to_target.get(c, 0.0) or 0.0) / 60.0
 
-        kwh_after_drive = current_kwh - dist1_km * kwh_per_km
-        add_kwh = max(max_soc_kwh - kwh_after_drive, 0.0)
+        dwpt_gained_leg1 = kwh_from_segments_on_leg(dwpt_segments, 0.0, dist1_km)
+        dwpt_gained_leg2 = kwh_from_segments_on_leg(dwpt_segments, dist1_km, dist2_km)
+
+        kwh_after_drive = min(start_kwh + dwpt_gained_leg1, max_soc_kwh)
+        kwh_after_drive = max(kwh_after_drive - dist1_km * kwh_per_km, 0.0)
+        if kwh_after_drive < reserve_kwh:
+            continue
+
+        required_departure_kwh = reserve_kwh + max(
+            dist2_km * kwh_per_km - dwpt_gained_leg2,
+            0.0,
+        )
+        if required_departure_kwh > max_soc_kwh + 1e-9:
+            continue
+
+        add_kwh = max(required_departure_kwh - kwh_after_drive, 0.0)
         charge_time_min = 60.0 * add_kwh / max(vehicle.charge_power_kw, 1e-6)
 
         total_cost = time1_min + time2_min + charge_time_min
@@ -326,6 +553,7 @@ def plan_single_charge_route(
             "dist1_km": dist1_km,
             "dist2_km": dist2_km,
             "add_kwh": add_kwh,
+            "required_departure_kwh": required_departure_kwh,
             "cost_minutes": total_cost,
             "total_dist_km": total_dist,
         }
@@ -344,26 +572,49 @@ def plan_single_charge_route(
     drive_actions_b = drive_actions_from_nodes(nodes_b)
     charge_coord = nodes_to_coords([best["charger_node"]])[0]
 
-    print(
+    drive_profile_a = battery_profile_for_nodes(nodes_a, start_kwh, dwpt_segments, 0.0)
+    kwh_at_charge = drive_profile_a["end_kwh"]
+    leg_a_dist_km = drive_profile_a["distance_km"]
+    leg_b_dist_km = sum(float(act[3]) for act in drive_actions_b)
+
+    # leg B starts at leg_a_dist_km into the route — segments apply correctly
+    required_departure_kwh = reserve_kwh + max(
+        leg_b_dist_km * kwh_per_km - dwpt_gained_leg2,
+        0.0,
+    )
+    required_departure_kwh = min(max(required_departure_kwh, kwh_at_charge), max_soc_kwh)
+    add_kwh = max(required_departure_kwh - kwh_at_charge, 0.0)
+    charge_time_min = 60.0 * add_kwh / max(vehicle.charge_power_kw, 1e-6)
+    charged_kwh = min(kwh_at_charge + add_kwh, max_soc_kwh)
+    drive_profile_b = battery_profile_for_nodes(nodes_b, charged_kwh, dwpt_segments, leg_a_dist_km)
+    time1_min = (time_from_source.get(best["charger_node"], 0.0) or 0.0) / 60.0
+    time2_min = (time_to_target.get(best["charger_node"], 0.0) or 0.0) / 60.0
+
+    log(
         "Chosen charger node: "
         f"{best['charger_node']} | dist1={best['dist1_km']:.2f} km | "
-        f"dist2={best['dist2_km']:.2f} km | charge={best['add_kwh']:.2f} kWh"
+        f"dist2={best['dist2_km']:.2f} km | charge={add_kwh:.2f} kWh"
     )
 
-    charge_action = ("CHARGE", best["charger_node"], best["add_kwh"], charge_time_min, charge_coord)
-    start_soc = float(np.clip(vehicle.current_soc, 0.0, 1.0))
-    soc_a = battery_profile_for_nodes(nodes_a, start_soc)
-    soc_at_charge = soc_a[-1] if soc_a else start_soc
-    soc_after_charge = vehicle.max_soc
-    soc_b = battery_profile_for_nodes(nodes_b, soc_after_charge)
+    charge_action = ("CHARGE", best["charger_node"], add_kwh, charge_time_min, charge_coord)
+    soc_a = drive_profile_a["socs"]
+    soc_b = drive_profile_b["socs"]
     full_soc = soc_a + (soc_b[1:] if soc_b else [])
+
+    # Build DWPT road coords for both legs combined
+    dwpt_road_coords_a = dwpt_coords_from_nodes(nodes_a, dwpt_segments, 0.0)
+    dwpt_road_coords_b = dwpt_coords_from_nodes(nodes_b, dwpt_segments, leg_a_dist_km)
+    dwpt_road_coords   = dwpt_road_coords_a + dwpt_road_coords_b
+
     return {
         "ok": True,
-        "cost_minutes": best["cost_minutes"],
+        "cost_minutes": time1_min + time2_min + charge_time_min,
         "actions": drive_actions_a + [charge_action] + drive_actions_b,
         "route_nodes": full_nodes,
         "route_coords": full_coords,
         "route_soc": full_soc,
+        "dwpt_kwh_gained": drive_profile_a["dwpt_gained_kwh"] + drive_profile_b["dwpt_gained_kwh"],
+        "dwpt_road_coords": dwpt_road_coords,
     }
 
 
@@ -379,6 +630,75 @@ def _sanitize_json(obj):
     if isinstance(obj, tuple):
         return [_sanitize_json(v) for v in obj]
     return obj
+
+
+def total_charge_time_minutes(route_result: Dict) -> float:
+    return sum(
+        float(action[3])
+        for action in route_result.get("actions", [])
+        if action and action[0] == "CHARGE"
+    )
+
+
+def total_charge_added_kwh(route_result: Dict) -> float:
+    return sum(
+        float(action[2])
+        for action in route_result.get("actions", [])
+        if action and action[0] == "CHARGE"
+    )
+
+
+def build_dwpt_summary_meta(
+    route_result: Dict,
+    baseline_result: Optional[Dict],
+    vehicle: VehicleSpec,
+    dwpt_km: float,
+) -> Dict:
+    charge_time_with_dwpt = total_charge_time_minutes(route_result)
+    charge_kwh_with_dwpt = total_charge_added_kwh(route_result)
+    charge_pct_with_dwpt = (
+        charge_kwh_with_dwpt / max(vehicle.battery_kwh, 1e-9)
+    ) * 100.0
+
+    dwpt_kwh_gained = float(route_result.get("dwpt_kwh_gained", 0.0))
+    dwpt_kwh_per_km = DWPT_POWER_KW / max(DWPT_SPEED_KMH, 1e-9)
+    dwpt_km_used = dwpt_kwh_gained / max(dwpt_kwh_per_km, 1e-9)
+
+    meta = {
+        "dwpt_km": dwpt_km,
+        "dwpt_km_used": round(min(dwpt_km_used, max(dwpt_km, 0.0)), 2),
+        "dwpt_kwh_gained": round(dwpt_kwh_gained, 3),
+        "charge_time_with_dwpt_min": round(charge_time_with_dwpt, 1),
+        "charge_added_kwh_with_dwpt": round(charge_kwh_with_dwpt, 3),
+        "charge_added_pct_with_dwpt": round(charge_pct_with_dwpt, 1),
+        "dwpt_time_saved_min": 0.0,
+        "dwpt_enabled_route": False,
+    }
+
+    if baseline_result and baseline_result.get("ok"):
+        charge_time_without_dwpt = total_charge_time_minutes(baseline_result)
+        charge_kwh_without_dwpt = total_charge_added_kwh(baseline_result)
+        charge_pct_without_dwpt = (
+            charge_kwh_without_dwpt / max(vehicle.battery_kwh, 1e-9)
+        ) * 100.0
+
+        meta.update(
+            {
+                "charge_time_without_dwpt_min": round(charge_time_without_dwpt, 1),
+                "charge_added_kwh_without_dwpt": round(charge_kwh_without_dwpt, 3),
+                "charge_added_pct_without_dwpt": round(charge_pct_without_dwpt, 1),
+                "dwpt_time_saved_min": round(
+                    max(charge_time_without_dwpt - charge_time_with_dwpt, 0.0),
+                    1,
+                ),
+            }
+        )
+    elif dwpt_km > 0.0:
+        # baseline failed (no charger reachable without DWPT) but DWPT made it work
+        baseline_failed = baseline_result is not None and not baseline_result.get("ok")
+        meta["dwpt_enabled_route"] = baseline_failed
+
+    return meta
 
 
 def run_route(
@@ -398,6 +718,7 @@ def run_route(
     target_cabin_temp: float = 22.0,
     charger_search_radius_km: float = 30.0,
     buffer_km: float = 10.0,
+    dwpt_km: float = 0.0,
 ) -> Dict:
     straight_km = haversine_km(src_lat, src_lon, dst_lat, dst_lon)
     min_buffer_km = straight_km / 2.0 + 10.0
@@ -406,16 +727,19 @@ def run_route(
 
     cache_name = cache_key(src_lat, src_lon, dst_lat, dst_lon, buffer_km, src_name, dst_name)
     cache_path = os.path.join(BASE_DIR, cache_name)
-    if os.path.exists(cache_path):
-        G = ox.load_graphml(cache_path)
-    else:
-        center_lat = (src_lat + dst_lat) / 2.0
-        center_lon = (src_lon + dst_lon) / 2.0
-        dist_m = max(500, int(buffer_km * 1000))
-        G = ox.graph_from_point((center_lat, center_lon), dist=dist_m, network_type="drive")
-        G = ox.add_edge_speeds(G)
-        G = ox.add_edge_travel_times(G)
-        ox.save_graphml(G, cache_path)
+    center_lat = (src_lat + dst_lat) / 2.0
+    center_lon = (src_lon + dst_lon) / 2.0
+    dist_m = max(500, int(buffer_km * 1000))
+    try:
+        G = load_or_build_graph(cache_path, center_lat, center_lon, dist_m)
+    except Exception as e:
+        return {
+            "ok": False,
+            "reason": (
+                "Road network download failed. The route is large and the Overpass server "
+                f"is unavailable right now. Details: {e}"
+            ),
+        }
 
     source_node = ox.distance.nearest_nodes(G, X=src_lon, Y=src_lat)
     target_node = ox.distance.nearest_nodes(G, X=dst_lon, Y=dst_lat)
@@ -449,7 +773,7 @@ def run_route(
         battery_kwh=battery_kwh,
         base_kwh_per_km=base_kwh_per_km,
         min_soc_reserve=min_soc_reserve,
-        max_soc=0.90,
+        max_soc=0.99,
         charge_power_kw=charge_power_kw,
         target_cabin_temp_c=target_cabin_temp,
         current_soc=current_soc,
@@ -463,12 +787,28 @@ def run_route(
         temp_c=temp_c,
         wind_kmh=wind_kmh,
         vehicle=vehicle,
+        dwpt_km=dwpt_km,
     )
     print(f"Routing ok: {result.get('ok')}")
     if not result.get("ok"):
         print("Routing failed:", result.get("reason"))
 
     if result.get("ok"):
+        baseline_result = None
+        if dwpt_km > 0.0:
+            baseline_result = plan_single_charge_route(
+                G=G,
+                source_node=source_node,
+                target_node=target_node,
+                chargers_df=chargers,
+                temp_c=temp_c,
+                wind_kmh=wind_kmh,
+                vehicle=vehicle,
+                dwpt_km=0.0,
+                verbose=False,
+            )
+        dwpt_meta = build_dwpt_summary_meta(result, baseline_result, vehicle, dwpt_km)
+
         if "route_soc" not in result or not result.get("route_soc"):
             # Fallback: compute SOC from actions if missing
             kwh_per_km = compute_kwh_per_km(temp_c, wind_kmh, vehicle)
@@ -484,20 +824,25 @@ def run_route(
                     cur_kwh = vehicle.battery_kwh * vehicle.max_soc
                     socs.append(float(np.clip(cur_kwh / vehicle.battery_kwh, 0.0, 1.0)))
             result["route_soc"] = socs
+        result["meta"] = {
+            "src": [src_lat, src_lon],
+            "dst": [dst_lat, dst_lon],
+            "temp_c": temp_c,
+            "wind_kmh": wind_kmh,
+            "src_name": src_name,
+            "dst_name": dst_name,
+            "battery_kwh": vehicle.battery_kwh,
+            "charge_power_kw": vehicle.charge_power_kw,
+            **dwpt_meta,
+        }
 
         route_out = _sanitize_json(
             {
                 "route_coords": result.get("route_coords", []),
                 "actions": result.get("actions", []),
                 "route_soc": result.get("route_soc", []),
-                "meta": {
-                    "src": [src_lat, src_lon],
-                    "dst": [dst_lat, dst_lon],
-                    "temp_c": temp_c,
-                    "wind_kmh": wind_kmh,
-                    "src_name": src_name,
-                    "dst_name": dst_name,
-                },
+                "dwpt_road_coords": result.get("dwpt_road_coords", []),
+                "meta": result["meta"],
             }
         )
         with open(os.path.join(BASE_DIR, "route_output.json"), "w", encoding="utf-8") as f:
@@ -536,6 +881,7 @@ class RouteHandler(SimpleHTTPRequestHandler):
         wind_kmh = payload.get("wind_kmh", None)
         buffer_km = float(payload.get("buffer_km", 10.0))
         charger_search_radius_km = float(payload.get("charger_search_radius_km", 30.0))
+        dwpt_km = float(payload.get("dwpt_km", 0.0))
 
         with open(os.path.join(BASE_DIR, "inputs.json"), "w", encoding="utf-8") as f:
             json.dump(_sanitize_json(payload), f, ensure_ascii=False)
@@ -558,6 +904,7 @@ class RouteHandler(SimpleHTTPRequestHandler):
             wind_kmh=float(wind_kmh) if wind_kmh is not None else None,
             charger_search_radius_km=charger_search_radius_km,
             buffer_km=buffer_km,
+            dwpt_km=dwpt_km,
         )
         body = json.dumps(_sanitize_json(result)).encode("utf-8")
         self.send_response(200)
@@ -566,8 +913,7 @@ class RouteHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
         if not result.get("ok"):
-            print("Stopping server due to routing failure.")
-            os._exit(1)
+            print(f"Routing failed (served error to client): {result.get('reason')}")
 
 
 def serve(host: str = "127.0.0.1", port: int = 8000):
@@ -604,6 +950,7 @@ def main():
     base_kwh_per_km = float(payload.get("base_kwh_per_km", 0.16))  # kWh/km
     charge_power_kw = float(payload.get("charge_power_kw", 50.0))  # kW
     target_cabin_temp = float(payload.get("target_cabin_temp", 22.0))  # Celsius
+    dwpt_km = float(payload.get("dwpt_km", 0.0))
 
     # Routing defaults (UI provides these in serve mode).
     charger_search_radius_km = float(payload.get("charger_search_radius_km", 30.0))
@@ -618,18 +965,20 @@ def main():
     print("\nConstructing graph using point-radius...")
     cache_name = cache_key(src_lat, src_lon, dst_lat, dst_lon, buffer_km, payload.get("src_name"), payload.get("dst_name"))
     cache_path = os.path.join(BASE_DIR, cache_name)
-    if os.path.exists(cache_path):
-        print(f"Loading cached graph: {cache_name}")
-        G = ox.load_graphml(cache_path)
-    else:
-        center_lat = (src_lat + dst_lat) / 2.0
-        center_lon = (src_lon + dst_lon) / 2.0
-        dist_m = max(500, int(buffer_km * 1000))
-        G = ox.graph_from_point((center_lat, center_lon), dist=dist_m, network_type="drive")
-        G = ox.add_edge_speeds(G)
-        G = ox.add_edge_travel_times(G)
-        ox.save_graphml(G, cache_path)
-        print(f"Graph saved to {cache_name}")
+    center_lat = (src_lat + dst_lat) / 2.0
+    center_lon = (src_lon + dst_lon) / 2.0
+    dist_m = max(500, int(buffer_km * 1000))
+    try:
+        if os.path.exists(cache_path):
+            print(f"Loading cached graph: {cache_name}")
+        G = load_or_build_graph(cache_path, center_lat, center_lon, dist_m)
+    except Exception as e:
+        print(
+            "Graph build failed. The route may be too large for the current Overpass "
+            f"server availability. Details: {e}",
+            file=sys.stderr,
+        )
+        return
 
 
     # Snap source/target to nearest graph nodes
@@ -695,7 +1044,7 @@ def main():
         battery_kwh=battery_kwh,
         base_kwh_per_km=base_kwh_per_km,
         min_soc_reserve=min_soc_reserve,
-        max_soc=0.90,
+        max_soc=0.99,
         charge_power_kw=charge_power_kw,
         target_cabin_temp_c=target_cabin_temp,
         current_soc=current_soc,
@@ -710,6 +1059,7 @@ def main():
         temp_c=temp_c,
         wind_kmh=wind_kmh,
         vehicle=vehicle,
+        dwpt_km=dwpt_km,
     )
 
     if not result["ok"]:
@@ -724,11 +1074,38 @@ def main():
             print(f"Estimated charging time: {act[3]:.1f} minutes")
             break
     if "route_coords" in result:
+        baseline_result = None
+        if dwpt_km > 0.0:
+            baseline_result = plan_single_charge_route(
+                G=G,
+                source_node=source_node,
+                target_node=target_node,
+                chargers_df=chargers,
+                temp_c=temp_c,
+                wind_kmh=wind_kmh,
+                vehicle=vehicle,
+                dwpt_km=0.0,
+                verbose=False,
+            )
+        dwpt_meta = build_dwpt_summary_meta(result, baseline_result, vehicle, dwpt_km)
+
         print(f"Route nodes count: {len(result['route_coords'])}")
         route_out = {
             "route_coords": result["route_coords"],
             "actions": result["actions"],
             "route_soc": result.get("route_soc", []),
+            "dwpt_road_coords": result.get("dwpt_road_coords", []),
+            "meta": {
+                "src": [src_lat, src_lon],
+                "dst": [dst_lat, dst_lon],
+                "temp_c": temp_c,
+                "wind_kmh": wind_kmh,
+                "src_name": payload.get("src_name"),
+                "dst_name": payload.get("dst_name"),
+                "battery_kwh": vehicle.battery_kwh,
+                "charge_power_kw": vehicle.charge_power_kw,
+                **dwpt_meta,
+            },
         }
         with open(os.path.join(BASE_DIR, "route_output.json"), "w", encoding="utf-8") as f:
             json.dump(route_out, f, ensure_ascii=False)

@@ -94,6 +94,18 @@
         🎯
         <input id="searchInput" type="text" placeholder="Destination" />
       </div>
+      <!-- DWPT ROAD INPUT -->
+      <div class="search-badge" title="Dynamic Wireless Charging road km along your route">
+        ⚡
+        <input
+          id="dwptInput"
+          type="number"
+          min="0"
+          step="1"
+          style="width: 55px; background: transparent; border: none; outline: none; color: white; font-size: 14px;"
+          placeholder="DWPT km"
+        />
+      </div>
       <div class="badge" style="cursor: pointer" id="goButton">Go</div>
     </div>
 
@@ -107,6 +119,7 @@
       let userMarker = null;
       let destMarker = null;
       let routePolyline = null;
+      let dwptPolylines = [];   // red DWPT road overlays
       let chargerMarkers = [];
       let sourceCoord = null;
       let destCoord = null;
@@ -118,6 +131,7 @@
       let animationTimer = null;
       let sourceFromClick = false;
       let hoverInfo = null;
+      let destinationSummaryInfo = null;
 
       /* ---------------------
    INIT MAP
@@ -334,6 +348,8 @@
           routePolyline.setMap(null);
           routePolyline = null;
         }
+        dwptPolylines.forEach((p) => p.setMap(null));
+        dwptPolylines = [];
         chargerMarkers.forEach((m) => m.setMap(null));
         chargerMarkers = [];
         if (carMarker) {
@@ -347,6 +363,10 @@
         if (hoverInfo) {
           hoverInfo.close();
           hoverInfo = null;
+        }
+        if (destinationSummaryInfo) {
+          destinationSummaryInfo.close();
+          destinationSummaryInfo = null;
         }
       }
 
@@ -367,29 +387,75 @@
         });
         routePolyline.setMap(map);
 
+        // --- DWPT road segments (red overlay) ---
+        if (Array.isArray(data.dwpt_road_coords) && data.dwpt_road_coords.length > 0) {
+          data.dwpt_road_coords.forEach((segment, idx) => {
+            if (!Array.isArray(segment) || segment.length < 2) return;
+            const segPath = segment.map(([lat, lon]) => ({ lat, lng: lon }));
+            const poly = new google.maps.Polyline({
+              path: segPath,
+              geodesic: true,
+              strokeColor: "#ef4444",   // Tailwind red-500
+              strokeOpacity: 1.0,
+              strokeWeight: 6,
+              zIndex: 10,               // draw on top of green route
+            });
+            poly.setMap(map);
+
+            // InfoWindow on click: show which chunk this is + kWh rate
+            const info = new google.maps.InfoWindow({
+              content: `<div style="color:#111827;font-family:Arial;">
+                          <strong>⚡ DWPT Road Segment ${idx + 1}</strong><br/>
+                          Wireless charging active<br/>
+                          Rate: 20 kW @ 40 km/h<br/>
+                          ≈ 0.5 kWh gained per km
+                        </div>`,
+            });
+            poly.addListener("click", (e) => {
+              info.setPosition(e.latLng);
+              info.open({ map });
+            });
+
+            dwptPolylines.push(poly);
+          });
+        }
+
         const bounds = new google.maps.LatLngBounds();
         path.forEach((p) => bounds.extend(p));
         map.fitBounds(bounds);
 
         if (Array.isArray(data.actions)) {
+          const batteryKwh = Number(
+            data && data.meta && data.meta.battery_kwh
+              ? data.meta.battery_kwh
+              : 60,
+          );
           data.actions.forEach((action) => {
             if (action[0] !== "CHARGE") return;
             const coord = action[4];
             if (!coord || coord.length !== 2) return;
             const [lat, lon] = coord;
+            const addedKwh = Number(action[2] || 0);
+            const chargeMin = Number(action[3] || 0);
+            const addedPct =
+              batteryKwh > 0 ? (addedKwh / batteryKwh) * 100 : null;
             const marker = new google.maps.Marker({
               position: { lat, lng: lon },
               map,
               icon: "http://maps.google.com/mapfiles/ms/icons/green-dot.png",
-              title: `Charge: ${action[2].toFixed(1)} kWh, ${action[3].toFixed(1)} min`,
+              title: `Predicted charging time: ${chargeMin.toFixed(1)} min`,
               label: {
-                text: `${action[3].toFixed(0)} min`,
+                text: `${chargeMin.toFixed(0)} min`,
                 color: "#0f172a",
                 fontWeight: "700",
               },
             });
+            const chargeDetails =
+              addedPct === null || Number.isNaN(addedPct)
+                ? `Charge added: ${addedKwh.toFixed(1)} kWh`
+                : `Charge added: ${addedKwh.toFixed(1)} kWh (${addedPct.toFixed(1)}%)`;
             const info = new google.maps.InfoWindow({
-              content: `<div style="color:#111827;font-family:Arial;">Charge: ${action[2].toFixed(1)} kWh<br/>Time: ${action[3].toFixed(1)} min</div>`,
+              content: `<div style="color:#111827;font-family:Arial;"><strong>Charging stop</strong><br/>Predicted charging time: ${chargeMin.toFixed(1)} min<br/>${chargeDetails}</div>`,
             });
             marker.addListener("click", () =>
               info.open({ anchor: marker, map }),
@@ -400,6 +466,7 @@
 
         animateRoute(data, path);
         attachRouteHover(data, path);
+        renderDestinationSummary(data, path);
       }
 
       /* ---------------------
@@ -524,6 +591,36 @@
           }
         });
       }
+
+      function renderDestinationSummary(data, path) {
+        const meta = data && data.meta ? data.meta : {};
+        const dwptKm = Number(meta.dwpt_km || 0);
+        if (dwptKm <= 0 || !path || path.length === 0) return;
+
+        const savedMin = Number(meta.dwpt_time_saved_min || 0);
+        const enabledRoute = !!meta.dwpt_enabled_route;
+        const dwptUsedKm = Number(meta.dwpt_km_used || 0);
+        const withChargeMin = Number(meta.charge_time_with_dwpt_min || 0);
+        const withoutChargeMin = Number(meta.charge_time_without_dwpt_min || 0);
+        const withChargePct = Number(meta.charge_added_pct_with_dwpt || 0);
+        const withoutChargePct = Number(meta.charge_added_pct_without_dwpt || 0);
+        let content = "";
+
+        if (enabledRoute) {
+          content =
+            `<div style="color:#111827;font-family:Arial;"><strong>DWPT impact</strong><br/>Dynamic charging made this route feasible.<br/>DWPT used on route: ${dwptUsedKm.toFixed(1)} km<br/>Predicted station charging time: ${withChargeMin.toFixed(1)} min (${withChargePct.toFixed(1)}%)</div>`;
+        } else {
+          content =
+            `<div style="color:#111827;font-family:Arial;"><strong>DWPT impact</strong><br/>Without DWPT: predicted station charging time ${withoutChargeMin.toFixed(1)} min (${withoutChargePct.toFixed(1)}%)<br/>With DWPT: predicted station charging time ${withChargeMin.toFixed(1)} min (${withChargePct.toFixed(1)}%)<br/>DWPT used on route: ${dwptUsedKm.toFixed(1)} km<br/>Standby charging time saved: ${savedMin.toFixed(1)} min</div>`;
+        }
+
+        destinationSummaryInfo = new google.maps.InfoWindow({
+          content,
+          position: path[path.length - 1],
+        });
+        destinationSummaryInfo.open({ map });
+      }
+
       function initBatteryInput() {
         const input = document.getElementById("batteryInput");
         if (!input) return;
@@ -542,6 +639,10 @@
       async function planRoute() {
         if (!sourceCoord || !destCoord) return;
 
+        const dwptInput = document.getElementById("dwptInput");
+        const dwptRaw = dwptInput ? parseFloat(dwptInput.value) : NaN;
+        const dwpt_km = (!isNaN(dwptRaw) && dwptRaw >= 0) ? dwptRaw : 0.0;
+
         const payload = {
           src_lat: sourceCoord.lat,
           src_lon: sourceCoord.lng,
@@ -552,6 +653,7 @@
           current_soc: batteryLevel,
           temp_c: weatherSnapshot ? weatherSnapshot.temp_c : null,
           wind_kmh: weatherSnapshot ? weatherSnapshot.wind_kmh : null,
+          dwpt_km: dwpt_km,
         };
 
         try {
@@ -562,6 +664,10 @@
           });
           if (!res.ok) return;
           const data = await res.json();
+          if (data && data.ok === false) {
+            alert(data.reason || "Route planning failed.");
+            return;
+          }
           renderRouteFromJson(data);
         } catch (e) {
           console.warn("Route request failed.", e);
